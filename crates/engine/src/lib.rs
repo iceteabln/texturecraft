@@ -42,6 +42,8 @@ mod preserve;
 pub mod preset_cmds;
 pub mod preview;
 pub mod project_cmds;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod project_import;
 pub mod quick_mask;
 pub mod resource_cmds;
 pub mod session;

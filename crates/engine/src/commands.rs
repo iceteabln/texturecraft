@@ -71,6 +71,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::bake::specs());
         v.extend(crate::materialx_cmds::specs());
         v.extend(crate::file_cmds::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(crate::project_import::specs());
         v.extend(crate::preset_cmds::specs());
         v.extend(crate::resource_cmds::specs());
         v.extend(crate::material_lib::specs());

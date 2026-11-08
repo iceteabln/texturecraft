@@ -17,7 +17,7 @@ use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
 
 /// What File › Open accepts: projects and meshes.
-pub const OPEN_EXTS: &[&str] = &[PROJECT_EXT, "glb", "gltf", "fbx", "dae", "usd", "usda", "usdc", "usdz", "abc", "obj", "ply", "stl"];
+pub const OPEN_EXTS: &[&str] = &[PROJECT_EXT, "glb", "gltf", "fbx", "dae", "usd", "usda", "usdc", "usdz", "abc", "obj", "ply", "stl", "spp"];
 
 /// Images File › Import resources accepts.
 pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "tif", "tiff", "bmp", "webp", "exr", "hdr"];
@@ -27,7 +27,7 @@ pub const ENV_EXTS: &[&str] = &["hdr", "exr"];
 
 /// Materials File › Import material adds as layers: smart materials, MaterialCraft portable
 /// materials and MaterialCraft packages.
-pub const MATERIAL_EXTS: &[&str] = &["tcmat", "mcmat", "mcraft"];
+pub const MATERIAL_EXTS: &[&str] = &["tcmat", "mcmat", "mcraft", "spsm", "spmsk", "sbsar"];
 
 /// Texture size of a project made from an opened mesh (smaller on the single-threaded web).
 const MESH_RESOLUTION: u32 = if cfg!(target_arch = "wasm32") { 1024 } else { 2048 };
@@ -114,6 +114,11 @@ fn use_environment(app: &mut TextureCraftApp, name: &str) {
 pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
     let path = std::path::Path::new(name);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if matches!(ext.as_str(), "spp" | "spsm" | "spmsk" | "sbsar") {
+        let error = "These project files open in the desktop app";
+        app.toast(trf("Couldn't import {name}: {error}", &[("name", &name), ("error", &error)]), true);
+        return;
+    }
     if IMAGE_EXTS.contains(&ext.as_str()) {
         match app.session.import_resource_bytes(name, bytes) {
             Ok(res) => {

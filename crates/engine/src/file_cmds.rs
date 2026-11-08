@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             new_from_mesh
         ),
-        cmd!("file.open", "Open...", ["File"], Some("Ctrl+O"), "{path: .tcraft project or mesh file}", always, open),
+        cmd!("file.open", "Open...", ["File"], Some("Ctrl+O"), "{path: .tcraft project, mesh, or .spp/.spsm/.spmsk/.sbsar}", always, open),
         cmd!("file.save", "Save", ["File"], Some("Ctrl+S"), "{path?: .tcraft (default: the project's own file)}", always, save),
         cmd!("file.saveAs", "Save as...", ["File"], Some("Ctrl+Shift+S"), "{path}", always, save_as),
         cmd!("file.saveCopy", "Save a copy...", ["File"], None, "{path}", always, save_copy),
@@ -388,6 +388,9 @@ fn new_from_mesh(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.open")?;
+    if matches!(ext_of(path).as_str(), "spp" | "spsm" | "spmsk" | "sbsar") {
+        return crate::project_import::dispatch(s, path, crate::materials::Place::from_params(p));
+    }
     let next = native::open_path(path)?;
     s.switch_to(next);
     Ok(crate::inspect::session(s))

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
+members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/projectfiles", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
 exclude = ["vendor"]
 default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
 

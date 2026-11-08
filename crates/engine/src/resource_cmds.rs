@@ -31,6 +31,25 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Largest accepted resource file.
 pub(crate) const MAX_BYTES: usize = 512 << 20;
 
+fn decoded_resource(file_name: &str, bytes: &[u8]) -> Result<Arc<ImageRes>> {
+    if bytes.len() > MAX_BYTES {
+        return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
+    }
+    texturecraft_formats::decode_image(bytes).map(decoded).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))
+}
+
+fn unique_resource_name(s: &Session, file_name: &str) -> String {
+    let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
+    let base = texturecraft_formats::sanitize_resource_name(leaf);
+    let mut name = base.clone();
+    let mut n = 2;
+    while s.doc.resources.contains_key(&name) {
+        name = format!("{n}_{base}");
+        n += 1;
+    }
+    name
+}
+
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
     Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
 }
@@ -38,24 +57,23 @@ pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
 impl Session {
     /// Add an image resource from bytes (one undo step); returns its unique, sanitized name.
     pub fn import_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        if bytes.len() > MAX_BYTES {
-            return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
-        }
-        let image = texturecraft_formats::decode_image(&bytes).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))?;
-        let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
-        let base = texturecraft_formats::sanitize_resource_name(leaf);
-        let mut name = base.clone();
-        let mut n = 2;
-        while self.doc.resources.contains_key(&name) {
-            name = format!("{n}_{base}");
-            n += 1;
-        }
+        let image = decoded_resource(file_name, &bytes)?;
+        let name = unique_resource_name(self, file_name);
         let key = name.clone();
         self.edit("Import resource", |s| {
             s.doc.resources.insert(key, Arc::new(bytes));
             Ok(())
         })?;
-        self.images.insert(name.clone(), decoded(image));
+        self.images.insert(name.clone(), image);
+        Ok(name)
+    }
+
+    /// Store an image resource without its own undo step (a larger edit owns the change).
+    pub(crate) fn store_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
+        let image = decoded_resource(file_name, &bytes)?;
+        let name = unique_resource_name(self, file_name);
+        self.doc.resources.insert(name.clone(), Arc::new(bytes));
+        self.images.insert(name.clone(), image);
         Ok(name)
     }
 
