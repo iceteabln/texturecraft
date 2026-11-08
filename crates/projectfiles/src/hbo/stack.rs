@@ -1,4 +1,4 @@
-//! Build `subcraft-spp-stack-v1` JSON from a decoded `DataDocument` root.
+//! Build `texturecraft-project-stack-v1` JSON from a decoded `DataDocument` root.
 
 use serde::Serialize;
 
@@ -23,7 +23,7 @@ pub fn build_stack_from_document(document_bin: &[u8]) -> Result<(SppStackFile, S
     }
     let materials_out = materials_from_root(&root)?;
     let file = SppStackFile {
-        format: "subcraft-spp-stack-v1".into(),
+        format: "texturecraft-project-stack-v1".into(),
         hbo_format: Some(hbo_format.to_string()),
         data_version: Some(data_version),
         materials: materials_out,
@@ -33,7 +33,7 @@ pub fn build_stack_from_document(document_bin: &[u8]) -> Result<(SppStackFile, S
 
 pub fn write_stack_json(document_bin: &[u8], path: &std::path::Path) -> Result<SppStackFile, String> {
     let (file, hbo_format, data_version) = build_stack_from_document(document_bin)?;
-    let export = StackExport { format: "subcraft-spp-stack-v1", hbo_format, data_version, materials: file.materials.clone() };
+    let export = StackExport { format: "texturecraft-project-stack-v1", hbo_format, data_version, materials: file.materials.clone() };
     let text = serde_json::to_string_pretty(&export).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(file)

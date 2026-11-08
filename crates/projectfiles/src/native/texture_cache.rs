@@ -587,7 +587,7 @@ fn downsample_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
     let th = th as usize;
     for y in 0..th {
         // the file's texture-cache is stored bottom-up (OpenGL texture origin v=0 at row 0),
-        // whereas TextureCraft bitmaps & mesh UVs use top-down origin (y=0 at v_subcraft=0 = 1-v_assbin).
+        // whereas TextureCraft bitmaps and mesh UVs use a top-down origin.
         let sy0 = (th - 1 - y) * sy;
         for x in 0..tw {
             let sx0 = x * sx;

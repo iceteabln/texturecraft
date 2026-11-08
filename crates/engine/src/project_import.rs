@@ -12,8 +12,8 @@ use texturecraft_core::{
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, SubMesh};
 use texturecraft_projectfiles::{
-    BakeManifest, CachedMaterialChannels, CachedMeshMap, SceneMapKind, SceneMesh, SppChannelBlend, SppContentEffect, SppLayerNode, SppMaskEffect,
-    SppMaskEffectKind, SppProceduralChannel, SppStackFile,
+    CachedMaterialChannels, CachedMeshMap, SceneMapKind, SceneMesh, SppChannelBlend, SppContentEffect, SppLayerNode, SppMaskEffect, SppMaskEffectKind,
+    SppProceduralChannel, SppStackFile,
 };
 
 use crate::commands::{CommandSpec, always, bad, strp};
@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project file",
         [],
         None,
-        "{path: .spp project, .spsm smart material, .spmsk smart mask, or .sbsar material, filter or generator}",
+        "{path: .spp project, .spsm smart material, .spmsk smart mask, or .sbsar generator or filter}",
         always,
         import_cmd
     )]
@@ -160,37 +160,12 @@ fn import_sbsar(s: &mut Session, path: &str, place: Place) -> Result<Value> {
             })?;
             Ok(json!({ "path": path, "kind": "filter", "layer": id.0, "name": name, "filter": filter_id }))
         }
-        ArchiveKind::Material => {
-            let size = s.doc.project.texture_set(s.ts()).map(|t| t.resolution).unwrap_or(1024);
-            let baked = bake_material(path, size)?;
-            let name = baked.name.clone();
-            let result = s.edit("Import material", |s| {
-                let ts = s.ts();
-                let channels = s.doc.project.texture_set(ts)?.channel_list();
-                let mut fill = Fill::default();
-                let mut enabled = BTreeSet::new();
-                for (channel, file_name, bytes) in baked.maps {
-                    if !channels.contains(&channel) {
-                        continue;
-                    }
-                    let resource = s.store_resource_bytes(&file_name, bytes)?;
-                    fill.sources.insert(channel, Source::image(resource));
-                    enabled.insert(channel);
-                }
-                if enabled.is_empty() {
-                    return Err(EngineError::Other(format!("{name} has no channel this texture set uses")));
-                }
-                let id = s.doc.project.alloc_id();
-                let mut layer = Layer::new(id, &name, LayerKind::Fill(fill), &channels);
-                layer.channels.retain(|c, _| enabled.contains(c));
-                let id = crate::layer_cmds::insert_selected(s, layer)?;
-                place.apply(s, id)?;
-                Ok(id)
-            });
-            s.sync_images();
-            let id = result?;
-            Ok(json!({ "path": path, "kind": "material", "layer": id.0, "name": name }))
-        }
+        ArchiveKind::Material => Err(bad(
+            "file.importProject",
+            format!(
+                "{path} is a compiled material graph. Open the .spp project or the .spsm smart material; those carry the live layer stack. Generators and known filters import from .sbsar directly."
+            ),
+        )),
     }
 }
 
@@ -287,62 +262,6 @@ fn filter_id_from_name(key: &str) -> Option<&'static str> {
         Some("grayscale")
     } else if key.contains("level") {
         Some("levels")
-    } else {
-        None
-    }
-}
-
-struct BakedMaterial {
-    name: String,
-    maps: Vec<(Channel, String, Vec<u8>)>,
-}
-
-fn bake_material(path: &str, size: u32) -> Result<BakedMaterial> {
-    let dir = std::env::temp_dir().join(format!("texturecraft-sbsar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(e.to_string()))?;
-    let manifest = texturecraft_projectfiles::bake_sbsar(Path::new(path), &dir, size, 0).map_err(EngineError::Other)?;
-    let baked = material_from_manifest(&dir, &manifest);
-    let _ = std::fs::remove_dir_all(&dir);
-    baked
-}
-
-fn material_from_manifest(dir: &Path, manifest: &BakeManifest) -> Result<BakedMaterial> {
-    let mut maps = Vec::new();
-    for output in &manifest.outputs {
-        let Some(channel) = channel_of_output(&output.identifier) else { continue };
-        if maps.iter().any(|(c, _, _)| *c == channel) {
-            continue;
-        }
-        let bytes = std::fs::read(dir.join(&output.file)).map_err(|e| EngineError::Other(format!("{}: {e}", output.file)))?;
-        let (ext, bytes): (&str, Vec<u8>) = if matches!(channel, Channel::BaseColor | Channel::Emissive) {
-            ("png", texturecraft_projectfiles::pixels::png_from_encoded(&bytes).map_err(EngineError::Other)?)
-        } else {
-            ("exr", texturecraft_projectfiles::pixels::exr_from_encoded(&bytes).map_err(EngineError::Other)?)
-        };
-        let file_name = format!("{}_{}.{}", manifest.graph, output.identifier, ext);
-        maps.push((channel, file_name, bytes));
-    }
-    if maps.is_empty() {
-        return Err(EngineError::Other(format!("{} baked no base color, roughness, metallic, normal or height map", manifest.graph)));
-    }
-    Ok(BakedMaterial { name: manifest.graph.clone(), maps })
-}
-
-fn channel_of_output(identifier: &str) -> Option<Channel> {
-    let id = identifier.to_ascii_lowercase().replace([' ', '-', '_'], "");
-    if id.contains("basecolor") || id == "diffuse" || id.contains("albedo") {
-        Some(Channel::BaseColor)
-    } else if id.contains("roughness") {
-        Some(Channel::Roughness)
-    } else if id.contains("metallic") || id.contains("metalness") {
-        Some(Channel::Metallic)
-    } else if id.contains("normal") && !id.contains("world") {
-        Some(Channel::Normal)
-    } else if id.contains("height") || id.contains("displacement") {
-        Some(Channel::Height)
-    } else if id.contains("emissive") || id.contains("emission") {
-        Some(Channel::Emissive)
     } else {
         None
     }

@@ -3,8 +3,8 @@
 //! `.spp` projects, `.spsm` smart materials and `.spmsk` smart masks are HDF5 containers with an
 //! HBO document. The layer stack (fills, folders, mask generators, procedural noises, levels and
 //! the filters the document stores as levels or procedural fills) is decoded in process.
-//! `.sbsar` materials and filters bake through the optional bake host when it is installed;
-//! generator archives map onto TextureCraft's mesh-map generators instead.
+//! `.sbsar` generators map onto TextureCraft's mesh-map generators. Known filters map onto the
+//! filter library. Compiled material graphs are not executed.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -25,7 +25,6 @@
 )]
 
 pub mod assbin;
-pub mod bake;
 pub mod hbo;
 mod native;
 pub mod pixels;
@@ -33,7 +32,6 @@ mod pod;
 mod stack;
 
 pub use assbin::{SceneMesh, import_assbin};
-pub use bake::{BakeManifest, BakedOutput, bake_sbsar, resolve_host};
 pub use hbo::{build_stack_from_document, decode_spmsk, decode_spsm};
 pub use native::{CachedMaterialChannels, CachedMeshMap, SceneMapKind, SppContainer, decode_scene_maps, decode_texture_cache, read_container};
 pub use stack::{

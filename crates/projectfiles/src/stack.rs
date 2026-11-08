@@ -165,7 +165,7 @@ pub struct SppSbsarRef {
     pub contrast: f32,
     pub disorder: f32,
     pub invert: bool,
-    /// the reference format `$randomseed` tweak (passed through to the bake host).
+    /// Seed tweak stored with the procedural fill.
     pub seed: i64,
 }
 
