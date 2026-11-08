@@ -12,8 +12,8 @@ use texturecraft_core::{
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, SubMesh};
 use texturecraft_projectfiles::{
-    CachedMaterialChannels, CachedMeshMap, SceneMapKind, SceneMesh, SppChannelBlend, SppContentEffect, SppLayerNode, SppMaskEffect, SppMaskEffectKind,
-    SppProceduralChannel, SppStackFile,
+    CachedMaterialChannels, CachedMeshMap, SceneMapKind, SceneMesh, SppChannelBlend, SppContentEffect, SppContentFilter, SppLayerNode, SppMaskEffect,
+    SppMaskEffectKind, SppProceduralChannel, SppStackFile,
 };
 
 use crate::commands::{CommandSpec, always, bad, strp};
@@ -289,6 +289,7 @@ fn empty_fill(name: &str) -> SppLayerNode {
         mask_effects: Vec::new(),
         mask_decal_hits: Vec::new(),
         mask_paint_strokes: Vec::new(),
+        content_filters: Vec::new(),
     }
 }
 
@@ -351,8 +352,9 @@ fn import_stack(s: &mut Session, stack: &SppStackFile, notes: &mut Vec<String>) 
             let _ = s.doc.project.remove_layer(id);
         }
         let channels = s.doc.project.texture_set(index)?.channel_list();
-        push_children(&mut s.doc.project, index, None, layers, &channels)?;
-        imported += count_nodes(layers);
+        let layers = fold_filter_layers(layers);
+        push_children(&mut s.doc.project, index, None, &layers, &channels)?;
+        imported += count_nodes(&layers);
         if let Some(top) = s.doc.project.texture_sets[index].stack.last().copied() {
             s.selected.insert(index, top);
         }
@@ -394,6 +396,9 @@ fn build_layer(project: &mut texturecraft_core::Project, channels: &[Channel], n
         layer.mask = Some(mask);
     }
     layer.content_effects = content_from(project, node);
+    for filter in &node.content_filters {
+        layer.content_effects.push(library_filter(project, filter));
+    }
     if matches!(layer.kind, LayerKind::Fill(_)) {
         let used = used_channels(node);
         if !used.is_empty() {
@@ -631,7 +636,62 @@ fn mask_kind(kind: &SppMaskEffectKind) -> EffectKind {
             EffectKind::Levels(texturecraft_core::Levels { in_low: *in_low, in_high: *in_high, gamma: *gamma, out_low: *out_low, out_high: *out_high })
         }
         SppMaskEffectKind::Invert => EffectKind::Filter(Filter::Invert),
+        SppMaskEffectKind::Filter { filter_id, amount } => library_filter_kind(filter_id, *amount),
     }
+}
+
+fn library_filter(project: &mut texturecraft_core::Project, filter: &SppContentFilter) -> Effect {
+    let mut effect = Effect::new(project.alloc_id(), library_filter_kind(&filter.filter_id, filter.amount));
+    effect.name = filter.name.clone();
+    effect
+}
+
+fn library_filter_kind(id: &str, amount: f32) -> EffectKind {
+    let amount = if amount.is_finite() { amount.clamp(0.0, 5.0) } else { 1.0 };
+    let radius = (amount * 8.0).clamp(0.5, 64.0);
+    let filter = match id {
+        "blur" => Filter::Blur { radius },
+        "highPass" => Filter::HighPass { radius },
+        "blurDirectional" => Filter::DirectionalBlur { radius, angle: 0.0 },
+        "slopeBlur" => Filter::SlopeBlur { radius, scale: 4.0, seed: 1 },
+        "hsl" => Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: amount.clamp(-1.0, 1.0) },
+        "invert" => Filter::Invert,
+        _ => Filter::Sharpen { amount },
+    };
+    EffectKind::Filter(filter)
+}
+
+/// A filter-only layer sharpens or blurs the layer under it. The document stores that as its own
+/// layer; TextureCraft's filters run on a layer's pixels, so the filter moves onto that layer.
+fn fold_filter_layers(nodes: &[SppLayerNode]) -> Vec<SppLayerNode> {
+    let mut out: Vec<SppLayerNode> = Vec::new();
+    for node in nodes {
+        let mut node = node.clone();
+        node.children = fold_filter_layers(&node.children);
+        if filter_only(&node)
+            && let Some(previous) = out.last_mut()
+        {
+            previous.content_filters.append(&mut node.content_filters);
+            continue;
+        }
+        out.push(node);
+    }
+    out
+}
+
+fn filter_only(node: &SppLayerNode) -> bool {
+    node.kind != "folder"
+        && !node.content_filters.is_empty()
+        && node.children.is_empty()
+        && node.mask_effects.is_empty()
+        && node.content_effects.is_empty()
+        && node.base_color.is_none()
+        && node.roughness.is_none()
+        && node.metallic.is_none()
+        && node.height.is_none()
+        && node.base_color_proc.is_none()
+        && node.roughness_proc.is_none()
+        && node.height_proc.is_none()
 }
 
 fn content_from(project: &mut texturecraft_core::Project, node: &SppLayerNode) -> Vec<Effect> {
@@ -873,6 +933,15 @@ mod tests {
         assert_eq!(filter_id_from_name("matfinish_hammered"), Some("matFinishHammered"));
         assert_eq!(filter_id_from_name("blur_hq"), Some("blur"));
         assert!(matches!(blend_mode("add"), BlendMode::LinearDodge));
+        let mut below = empty_fill("Base");
+        below.base_color = Some([0.2, 0.2, 0.2]);
+        let mut sharpen = empty_fill("Sharpen");
+        sharpen.content_filters.push(SppContentFilter { name: "sharpen".into(), filter_id: "sharpen".into(), amount: 0.8 });
+        let folded = fold_filter_layers(&[below, sharpen]);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].name, "Base");
+        assert_eq!(folded[0].content_filters.len(), 1);
+        assert!(matches!(library_filter_kind("sharpen", 0.8), EffectKind::Filter(Filter::Sharpen { amount }) if (amount - 0.8).abs() < 1e-4));
     }
 
     fn env_file(key: &str) -> Option<std::path::PathBuf> {

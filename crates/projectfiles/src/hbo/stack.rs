@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use super::decode::{UNode, Value, array_items, field, object_val, prim_bool, prim_bytes, prim_int, string_val};
 use crate::stack::{
-    SppChannelBlend, SppContentEffect, SppDecalHit, SppLayerNode, SppMaskEffect, SppMaskEffectKind, SppMaterialStack, SppPaintStroke, SppProceduralChannel,
-    SppStackFile, SppTextureSetStack,
+    SppChannelBlend, SppContentEffect, SppContentFilter, SppDecalHit, SppLayerNode, SppMaskEffect, SppMaskEffectKind, SppMaterialStack, SppPaintStroke,
+    SppProceduralChannel, SppStackFile, SppTextureSetStack, filter_from_graph_url,
 };
 
 #[derive(Serialize)]
@@ -189,6 +189,7 @@ fn layer_export(node: &UNode, depth: u32) -> SppLayerNode {
             mask_effects: vec![],
             mask_decal_hits: vec![],
             mask_paint_strokes: vec![],
+            content_filters: vec![],
         };
     }
     let label = string_val(field(node, "label").unwrap_or(&Value::Null)).unwrap_or_else(|| node.type_name.clone());
@@ -222,6 +223,7 @@ fn layer_export(node: &UNode, depth: u32) -> SppLayerNode {
             mask_effects,
             mask_decal_hits,
             mask_paint_strokes,
+            content_filters: vec![],
         },
         "DataLayerPaint" => {
             let fill = extract_fill_channels(node, &label, &channel_blends);
@@ -246,6 +248,7 @@ fn layer_export(node: &UNode, depth: u32) -> SppLayerNode {
                 mask_effects,
                 mask_decal_hits,
                 mask_paint_strokes,
+                content_filters: fill.filters,
             }
         }
         other => {
@@ -271,6 +274,7 @@ fn layer_export(node: &UNode, depth: u32) -> SppLayerNode {
                 mask_effects,
                 mask_decal_hits,
                 mask_paint_strokes,
+                content_filters: fill.filters,
             }
         }
     }
@@ -419,6 +423,7 @@ struct ExtractedFill {
     triplanar: bool,
     uv_scale: Option<f32>,
     content_effects: Vec<SppContentEffect>,
+    filters: Vec<SppContentFilter>,
 }
 
 fn hash_url_seed(url: &str, random_seed: i64) -> u32 {
@@ -579,7 +584,11 @@ fn extract_fill_channels(layer: &UNode, layer_label: &str, channel_blends: &[Spp
             continue;
         }
         if act.type_name == "DataActionFilterProcedural" {
-            extract_content_filter_procedural(act, layer_label, &mut out);
+            if let Some(filter) = content_filter_action(act) {
+                out.filters.push(filter);
+            } else {
+                extract_content_filter_procedural(act, layer_label, &mut out);
+            }
             continue;
         }
         if act.type_name != "DataActionFill" {
@@ -807,7 +816,8 @@ fn extract_procedural_tweaks(proc_node: &UNode, mask: u64, layer_label: &str, ou
             || name == "wood_roughness"
             || name == "leather_roughness"
             || name == "plastic_roughness"
-            || name == "rust_roughness")
+            || name == "rust_roughness"
+            || name == "roughness_value")
             && (mask & CH_ROUGHNESS != 0)
         {
             if let Some(v) = prim_f32(val) {
@@ -1032,6 +1042,51 @@ fn extract_procedural_tweaks(proc_node: &UNode, mask: u64, layer_label: &str, ou
             out.metallic = Some(0.05);
         }
     }
+    apply_material_relief(&url, &get_f32, &get_int, out);
+}
+
+fn apply_material_relief(url: &str, get_f32: &impl Fn(&[&str], f32) -> f32, get_int: &impl Fn(&[&str], i64) -> i64, out: &mut ExtractedFill) {
+    if out.height_proc.is_some() {
+        return;
+    }
+    let pattern = if url.contains("grill") || url.contains("triangle_scale") || url.contains("scales") {
+        "cells"
+    } else if url.contains("rust") || url.contains("stain") || url.contains("steel") || url.contains("_bitmap") {
+        "grunge"
+    } else {
+        return;
+    };
+    let range = get_f32(&["height_range"], 0.0);
+    if range <= 0.001 && pattern != "cells" {
+        return;
+    }
+    let position = get_f32(&["height_position"], 0.5).clamp(0.0, 1.0);
+    let span = if range > 0.001 { range.clamp(0.01, 1.0) } else { 0.12 };
+    let mid = (position - 0.5) * 2.0;
+    let scale = get_int(&["scale", "tile"], 8).clamp(1, 64) as f32;
+    out.height_proc = Some(SppProceduralChannel {
+        pattern: pattern.into(),
+        seed: hash_url_seed(url, get_int(&["$randomseed"], 0)),
+        scale,
+        balance: 0.5,
+        contrast: get_f32(&["contrast", "surface_detail"], 0.35).clamp(0.05, 1.0),
+        invert: false,
+        low: (mid - span).clamp(-1.0, 1.0),
+        high: (mid + span).clamp(-1.0, 1.0),
+    });
+}
+
+fn content_filter_action(act: &UNode) -> Option<SppContentFilter> {
+    let mut procs = Vec::new();
+    collect_nodes_of_type(act, "DataProcedural", &mut procs);
+    let primary = procs.first()?;
+    let url = string_val(field(primary, "urlToSbsRes").unwrap_or(&Value::Null)).unwrap_or_default();
+    let filter_id = filter_from_graph_url(&url)?;
+    let mut tweaks = std::collections::HashMap::<String, &Value>::new();
+    collect_direct_procedural_tweaks(primary, &mut tweaks);
+    let amount =
+        ["intensity", "amount", "sharpen", "radius"].iter().find_map(|key| tweaks.get(*key).and_then(|value| prim_f32(value))).unwrap_or(1.0).clamp(0.0, 5.0);
+    Some(SppContentFilter { name: filter_id.to_string(), filter_id: filter_id.to_string(), amount })
 }
 
 fn extract_mask_effects(layer: &UNode, layer_label: &str) -> Vec<SppMaskEffect> {
@@ -1168,6 +1223,17 @@ fn extract_mask_filter_procedural_action(act: &UNode, out: &mut Vec<SppMaskEffec
         return;
     };
     let url = string_val(field(primary, "urlToSbsRes").unwrap_or(&Value::Null)).unwrap_or_default().to_lowercase();
+    if let Some(filter_id) = filter_from_graph_url(&url) {
+        let mut tweaks = std::collections::HashMap::<String, &Value>::new();
+        collect_direct_procedural_tweaks(primary, &mut tweaks);
+        let amount = ["intensity", "amount", "sharpen", "radius"]
+            .iter()
+            .find_map(|key| tweaks.get(*key).and_then(|value| prim_f32(value)))
+            .unwrap_or(1.0)
+            .clamp(0.0, 5.0);
+        out.push(SppMaskEffect { name: filter_id.into(), opacity, blend, kind: SppMaskEffectKind::Filter { filter_id: filter_id.into(), amount } });
+        return;
+    }
     if url.contains("histogram_scan") {
         let mut tweaks = std::collections::HashMap::<String, &Value>::new();
         collect_direct_procedural_tweaks(primary, &mut tweaks);

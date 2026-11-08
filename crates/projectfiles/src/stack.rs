@@ -70,6 +70,18 @@ pub struct SppLayerNode {
     pub mask_decal_hits: Vec<SppDecalHit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask_paint_strokes: Vec<SppPaintStroke>,
+    /// Filters stored on the layer (sharpen, blur, and the rest of the filter library).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_filters: Vec<SppContentFilter>,
+}
+
+/// A filter the document applies to a layer, with the intensity it stored.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct SppContentFilter {
+    pub name: String,
+    /// Filter library id (`sharpen`, `blur`, …).
+    pub filter_id: String,
+    pub amount: f32,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -211,6 +223,37 @@ pub enum SppMaskEffectKind {
         out_high: f32,
     },
     Invert,
+    /// A filter library effect (`sharpen`, `blur`, …) with its stored intensity.
+    Filter {
+        filter_id: String,
+        amount: f32,
+    },
+}
+
+/// A graph URL TextureCraft can run with its own filter, or `None` when the URL is a generator,
+/// a noise or a material fill.
+pub fn filter_from_graph_url(url: &str) -> Option<&'static str> {
+    let url = url.to_ascii_lowercase();
+    if url.contains("mg_") || url.contains("grunge") || url.contains("noise") || url.contains("finish_") || url.contains("matfinish") || url.contains("cloud") {
+        return None;
+    }
+    if url.contains("sharpen") {
+        Some("sharpen")
+    } else if url.contains("highpass") || url.contains("high_pass") {
+        Some("highPass")
+    } else if url.contains("slope_blur") || url.contains("blur_slope") {
+        Some("slopeBlur")
+    } else if url.contains("directional_blur") || url.contains("blur_directional") {
+        Some("blurDirectional")
+    } else if url.contains("hsl") || url.contains("hueshift") {
+        Some("hsl")
+    } else if url.contains("/blur") || url.ends_with("blur") {
+        Some("blur")
+    } else if url.contains("/invert") || url.ends_with("/invert") {
+        Some("invert")
+    } else {
+        None
+    }
 }
 
 fn default_seed() -> u32 {
@@ -236,4 +279,18 @@ fn default_true() -> bool {
 pub fn load_stack(path: &Path) -> Result<SppStackFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("stack json: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_from_graph_url;
+
+    #[test]
+    fn graph_urls_pick_filters_and_leave_generators() {
+        assert_eq!(filter_from_graph_url("resource://shelf/fx_sharpen/sharpen"), Some("sharpen"));
+        assert_eq!(filter_from_graph_url("resource://shelf/blur/blur"), Some("blur"));
+        assert_eq!(filter_from_graph_url("resource://shelf/mg_metal_edge_wear/mg_metal_edge_wear"), None);
+        assert_eq!(filter_from_graph_url("resource://shelf/finish_grainy/finish_grainy"), None);
+        assert_eq!(filter_from_graph_url("resource://shelf/grunge_scratches/grunge_scratches"), None);
+    }
 }

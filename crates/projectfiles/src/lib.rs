@@ -35,6 +35,6 @@ pub use assbin::{SceneMesh, import_assbin};
 pub use hbo::{build_stack_from_document, decode_spmsk, decode_spsm};
 pub use native::{CachedMaterialChannels, CachedMeshMap, SceneMapKind, SppContainer, decode_scene_maps, decode_texture_cache, read_container};
 pub use stack::{
-    SppChannelBlend, SppContentEffect, SppLayerNode, SppMaskEffect, SppMaskEffectKind, SppMaterialStack, SppProceduralChannel, SppSbsarRef, SppStackFile,
-    SppTextureSetStack,
+    SppChannelBlend, SppContentEffect, SppContentFilter, SppLayerNode, SppMaskEffect, SppMaskEffectKind, SppMaterialStack, SppProceduralChannel, SppSbsarRef,
+    SppStackFile, SppTextureSetStack, filter_from_graph_url,
 };
