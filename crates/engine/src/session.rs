@@ -318,6 +318,9 @@ pub struct Session {
     pub mesh: Arc<Mesh>,
     /// Unique per loaded mesh and UV layout (GPU caches compare it).
     pub mesh_id: u64,
+    /// Unique per open project: a mesh reimport or UV layout change keeps it, and opening, closing
+    /// or creating a project replaces it.
+    pub project_id: u64,
     /// The mesh with its own UVs (`mesh` maps UV-tiled sets into their atlas).
     pub(crate) source: Arc<Mesh>,
     pub bvh: Arc<Bvh>,
@@ -384,6 +387,7 @@ impl Session {
         Ok(Session {
             doc,
             mesh_id: next_mesh_id(),
+            project_id: next_mesh_id(),
             source,
             mesh,
             bvh: Arc::new(bvh),

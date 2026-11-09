@@ -31,50 +31,40 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Largest accepted resource file.
 pub(crate) const MAX_BYTES: usize = 512 << 20;
 
-fn decoded_resource(file_name: &str, bytes: &[u8]) -> Result<Arc<ImageRes>> {
-    if bytes.len() > MAX_BYTES {
-        return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
-    }
-    texturecraft_formats::decode_image(bytes).map(decoded).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))
-}
-
-fn unique_resource_name(s: &Session, file_name: &str) -> String {
-    let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
-    let base = texturecraft_formats::sanitize_resource_name(leaf);
-    let mut name = base.clone();
-    let mut n = 2;
-    while s.doc.resources.contains_key(&name) {
-        name = format!("{n}_{base}");
-        n += 1;
-    }
-    name
-}
-
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
     Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
 }
 
 impl Session {
-    /// Add an image resource from bytes (one undo step); returns its unique, sanitized name.
+    /// Add an image resource from bytes (one undo step); returns its unique, sanitized name
     pub fn import_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        let image = decoded_resource(file_name, &bytes)?;
-        let name = unique_resource_name(self, file_name);
-        let key = name.clone();
-        self.edit("Import resource", |s| {
-            s.doc.resources.insert(key, Arc::new(bytes));
-            Ok(())
-        })?;
-        self.images.insert(name.clone(), image);
+        self.edit("Import resource", |s| s.add_image_resource(file_name, bytes, u64::MAX))
+    }
+
+    /// Add an image within a decoded texel budget, inside the caller's edit
+    pub(crate) fn add_image_resource(&mut self, file_name: &str, bytes: Vec<u8>, max_texels: u64) -> Result<String> {
+        if bytes.len() > MAX_BYTES {
+            return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
+        }
+
+        let image = texturecraft_formats::decode_image_within(&bytes, max_texels).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))?;
+        let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
+        let base = texturecraft_formats::sanitize_resource_name(leaf);
+        let mut name = base.clone();
+        let mut n = 2;
+        while self.doc.resources.contains_key(&name) {
+            name = format!("{n}_{base}");
+            n += 1;
+        }
+
+        self.doc.resources.insert(name.clone(), Arc::new(bytes));
+        self.images.insert(name.clone(), decoded(image));
         Ok(name)
     }
 
     /// Store an image resource without its own undo step (a larger edit owns the change).
     pub(crate) fn store_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        let image = decoded_resource(file_name, &bytes)?;
-        let name = unique_resource_name(self, file_name);
-        self.doc.resources.insert(name.clone(), Arc::new(bytes));
-        self.images.insert(name.clone(), image);
-        Ok(name)
+        self.add_image_resource(file_name, bytes, u64::MAX)
     }
 
     /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
@@ -116,13 +106,42 @@ fn list(s: &Session) -> Value {
 #[cfg(not(target_arch = "wasm32"))]
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("resource.import", "`path` is required"))?;
-    let meta = std::fs::metadata(path).map_err(|e| bad("resource.import", format!("cannot read {path}: {e}")))?;
-    if meta.len() > MAX_BYTES as u64 {
-        return Err(bad("resource.import", format!("{path} is too large")));
-    }
-    let bytes = std::fs::read(path).map_err(|e| bad("resource.import", format!("cannot read {path}: {e}")))?;
+    let bytes = read_image_file("resource.import", path, MAX_BYTES as u64)?;
     let name = s.import_resource_bytes(path, bytes)?;
     Ok(json!({ "name": name }))
+}
+
+/// Read a regular image file within both the per-file cap and the caller's remaining byte budget
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_image_file(cmd: &str, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let max_bytes = max_bytes.min(MAX_BYTES as u64);
+    let read_error = |error| bad(cmd, format!("cannot read {path}: {error}"));
+    let too_large = || bad(cmd, format!("{path} is too large (limit {max_bytes} bytes)"));
+    let metadata = std::fs::metadata(path).map_err(read_error)?;
+    // Pipes can block on open, and devices may never reach EOF
+    if !metadata.is_file() {
+        return Err(bad(cmd, format!("{path} is not a regular file")));
+    }
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+
+    // Bound the read even if the file grows after the metadata check
+    let file = std::fs::File::open(path).map_err(read_error)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes).map_err(read_error)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_image_file(cmd: &str, _: &str, _: u64) -> Result<Vec<u8>> {
+    Err(bad(cmd, "file paths are not available in the browser"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -182,4 +201,25 @@ fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
         crate::layer_cmds::insert_selected(s, Layer::new(id, layer_name, LayerKind::Fill(fill), &[ch]))
     })?;
     Ok(json!({ "layer": id.0 }))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_reads_obey_the_remaining_byte_budget() {
+        let path = std::env::temp_dir().join(format!("texturecraft-read-image-{}.png", std::process::id()));
+        std::fs::write(&path, b"1234").unwrap();
+        let name = path.to_str().unwrap();
+        assert!(read_image_file("test", name, 3).unwrap_err().to_string().contains("too large"));
+        assert_eq!(read_image_file("test", name, 4).unwrap(), b"1234");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_are_rejected_before_reading() {
+        assert!(read_image_file("test", "/dev/null", 16).unwrap_err().to_string().contains("not a regular file"));
+    }
 }
