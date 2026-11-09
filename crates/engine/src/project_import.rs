@@ -815,7 +815,8 @@ fn bake_missing_maps(s: &mut Session) -> usize {
             set.bake.high_poly.use_low_as_high = true;
             set.bake.maps.select(missing.iter().copied());
         }
-        let outcome = s.bake_now(ts, true);
+        // The desktop app installs a GPU tracer. Forcing the CPU here is what made an open take minutes.
+        let outcome = s.bake_now(ts, false);
         if let Ok(set) = s.doc.project.texture_set_mut(ts) {
             set.bake.maps.select(FILE_MAPS);
         }
