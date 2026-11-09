@@ -1,14 +1,15 @@
 // Shared ray casting of the GPU path tracer (trace.wgsl) and the GPU baker (bake.wgsl), each
 // concatenated after this file: the BVH buffers (gpu_trace.rs `bvh_rows` layout), Möller–Trumbore
-// with the CPU's edge slack, and the stack traversal of `texturecraft_geom::Bvh`. The including
-// shader defines `fn accept(i: u32, d: vec3<f32>) -> bool`, which filters the triangles a ray
-// may hit (BVH order index, ray direction).
+// with the CPU's edge slack, and the traversal of `texturecraft_geom::Bvh`. The including shader
+// defines `fn accept(i: u32, d: vec3<f32>) -> bool`, which filters the triangles a ray may hit
+// (BVH order index, ray direction).
 
 const NONE: u32 = 0xffffffffu;
-const STACK: u32 = 64u;
 const EDGE: f32 = 1e-5;
 
-// Per node: (lo, first child or triangle), (hi, triangle count; 0 for inner nodes); floats as bits.
+// Per node: (lo, first child or triangle), (hi, triangle count; 0 for inner nodes), (parent, _, _, _);
+// floats as bits. The parent link keeps the walk in registers: a per-thread stack of 64 lived in
+// local memory and dominated bake time at 4K with subsampling.
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
 // Per triangle in BVH order: (p0, w), (p1, w), (p2, w), (u32 x4); floats as bits, the w words and
 // last row are the including shader's.
@@ -41,8 +42,8 @@ struct Hit {
 };
 
 fn slab(n: u32, o: vec3<f32>, inv: vec3<f32>, tmax: f32) -> f32 {
-    let lo = bitcast<vec3<f32>>(nodes[n * 2u].xyz);
-    let hi = bitcast<vec3<f32>>(nodes[n * 2u + 1u].xyz);
+    let lo = bitcast<vec3<f32>>(nodes[n * 3u].xyz);
+    let hi = bitcast<vec3<f32>>(nodes[n * 3u + 1u].xyz);
     let t0 = (lo - o) * inv;
     let t1 = (hi - o) * inv;
     let tn = max(max3(min(t0, t1)), 0.0);
@@ -81,62 +82,75 @@ fn hit_tri(i: u32, o: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
     return select(miss, vec3<f32>(t, u, v), t > 0.0);
 }
 
+// The child entered first. Distances are against the ray's original limit, so the choice does not
+// change when a closer hit shrinks the search.
+fn nearer_child(left: u32, right: u32, dl: f32, dr: f32) -> u32 {
+    if (dl >= 0.0 && (dr < 0.0 || dl <= dr)) {
+        return left;
+    }
+    if (dr >= 0.0) {
+        return right;
+    }
+    return NONE;
+}
+
 // Closest accepted hit before `tmax` (or any, for shadow rays) in the BVH rooted at node `root`;
-// idx NONE when nothing is hit.
+// idx NONE when nothing is hit. Parent links replace the traversal stack.
 fn traverse_from(root: u32, o: vec3<f32>, d: vec3<f32>, tmax: f32, any_hit: bool) -> Hit {
     var best = Hit(tmax, NONE, 0.0, 0.0);
     // Zero direction components would give 0·∞ in the slab test.
     let sd = select(d, select(vec3<f32>(-1e-20), vec3<f32>(1e-20), d >= vec3<f32>(0.0)), abs(d) < vec3<f32>(1e-20));
     let inv = 1.0 / sd;
-    var stack_n: array<u32, STACK>;
-    var stack_t: array<f32, STACK>;
-    let root_t = slab(root, o, inv, best.t);
-    if (root_t < 0.0) {
+    if (slab(root, o, inv, best.t) < 0.0) {
         return best;
     }
-    stack_n[0] = root;
-    stack_t[0] = root_t;
-    var sp = 1u;
+    var node = root;
+    var prev = NONE;
+    // A correct walk steps at most three times per node (enter, return from the near child,
+    // return from the far one). The cap turns a malformed tree into a miss instead of a hang.
+    var steps = 0u;
     loop {
-        if (sp == 0u) {
+        steps += 1u;
+        if (node == NONE || steps > 16777216u) {
             break;
         }
-        sp -= 1u;
-        let ni = stack_n[sp];
-        if (stack_t[sp] > best.t) {
-            continue;
-        }
-        let first = nodes[ni * 2u].w;
-        let count = nodes[ni * 2u + 1u].w;
-        if (count > 0u) {
-            for (var i = first; i < first + count; i++) {
-                let h = hit_tri(i, o, d);
-                if (h.x > 0.0 && h.x < best.t && accept(i, d)) {
-                    best = Hit(h.x, i, h.y, h.z);
-                    if (any_hit) {
-                        return best;
+        let parent = nodes[node * 3u + 2u].x;
+        let first = nodes[node * 3u].w;
+        let count = nodes[node * 3u + 1u].w;
+        if (prev == parent) {
+            if (count > 0u) {
+                for (var i = first; i < first + count; i++) {
+                    let h = hit_tri(i, o, d);
+                    if (h.x > 0.0 && h.x < best.t && accept(i, d)) {
+                        best = Hit(h.x, i, h.y, h.z);
+                        if (any_hit) {
+                            return best;
+                        }
                     }
                 }
+                prev = node;
+                node = parent;
+            } else {
+                let left = first;
+                let right = first + 1u;
+                let child = nearer_child(left, right, slab(left, o, inv, best.t), slab(right, o, inv, best.t));
+                prev = node;
+                node = select(parent, child, child != NONE);
             }
+        } else if (count > 0u) {
+            prev = node;
+            node = parent;
         } else {
-            // Visit the nearer child first.
-            let dl = slab(first, o, inv, best.t);
-            let dr = slab(first + 1u, o, inv, best.t);
-            if (dl >= 0.0 && dr >= 0.0 && sp + 2u <= STACK) {
-                let near_first = dl <= dr;
-                stack_n[sp] = select(first, first + 1u, near_first);
-                stack_t[sp] = select(dl, dr, near_first);
-                stack_n[sp + 1u] = select(first + 1u, first, near_first);
-                stack_t[sp + 1u] = select(dr, dl, near_first);
-                sp += 2u;
-            } else if (dl >= 0.0 && sp < STACK) {
-                stack_n[sp] = first;
-                stack_t[sp] = dl;
-                sp += 1u;
-            } else if (dr >= 0.0 && sp < STACK) {
-                stack_n[sp] = first + 1u;
-                stack_t[sp] = dr;
-                sp += 1u;
+            let left = first;
+            let right = first + 1u;
+            let near = nearer_child(left, right, slab(left, o, inv, tmax), slab(right, o, inv, tmax));
+            let far = select(left, right, near == left);
+            if (near != NONE && prev == near && slab(far, o, inv, best.t) >= 0.0) {
+                prev = node;
+                node = far;
+            } else {
+                prev = node;
+                node = parent;
             }
         }
     }

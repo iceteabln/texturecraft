@@ -15,7 +15,7 @@ use texturecraft_core::{AmbientOcclusionAttenuation, BackfaceMode};
 use texturecraft_geom::Hit;
 use texturecraft_geom::glam::Vec3;
 
-use crate::gpu_trace::{STACK, buffer, bvh_depth, bvh_rows, entry, scoped, storage};
+use crate::gpu_trace::{buffer, bvh_depth, bvh_rows, entry, scoped, storage};
 
 const WORKGROUP: u32 = 64;
 /// Rays per dispatch: short dispatches keep slow GPUs clear of driver watchdogs.
@@ -152,10 +152,10 @@ impl Tracer for GpuBaker {
         let (mut nodes, mut tris, mut roots) = (Vec::new(), Vec::new(), Vec::new());
         for m in meshes {
             let tree: Vec<_> = m.bvh.nodes().collect();
-            if bvh_depth(&tree).is_none_or(|d| d >= STACK) {
-                return Err(err("a mesh's BVH is too deep for GPU traversal"));
+            if bvh_depth(&tree).is_none() {
+                return Err(err("a mesh's BVH is malformed"));
             }
-            let base = ((nodes.len() / 2) as u32, (tris.len() / 4) as u32);
+            let base = ((nodes.len() / 3) as u32, (tris.len() / 4) as u32);
             roots.push(base.0);
             let (n, t) = bvh_rows(m.bvh, base, |o| {
                 ([m.keys.get(o).copied().unwrap_or(ANY), u32::from(m.backface_culling.get(o).copied().unwrap_or(false)), 0], [0, 0, 0, o as u32])
@@ -307,6 +307,19 @@ fn row(v: Vec3, w: u32) -> [u32; 4] {
 }
 
 impl RayScene for GpuScene<'_> {
+    fn ray_batch(&self) -> usize {
+        // One readback per call. Stay under an eighth of the storage buffer so the upload, the
+        // result and the staging copy fit together, and never exceed one full dispatch.
+        let budget = (self.gpu.max_buffer() / 8) as usize;
+        (budget / size_of::<Ray>()).clamp(1 << 18, RAYS_PER_DISPATCH)
+    }
+
+    fn sample_batch(&self) -> usize {
+        // A hemisphere query is four vec4s. Several output rows then share one readback.
+        let budget = (self.gpu.max_buffer() / 8) as usize;
+        (budget / 64).clamp(1 << 16, 1 << 20)
+    }
+
     fn closest(&mut self, mesh: usize, rays: &[Ray], ignore_backface: bool) -> Result<Vec<Option<Hit>>, BakeError> {
         let pass = Pass {
             params: Params { root: self.root(mesh)?, flags: u32::from(ignore_backface) * IGNORE_BACKFACE, ..Params::default() },

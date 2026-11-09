@@ -24,8 +24,6 @@ use crate::trace::{TraceDisplay, TraceScene, TraceSettings};
 
 /// Texture sets the tracer takes (one more array layer holds the default material).
 pub const MAX_SETS: usize = 255;
-/// Depth of the shader's BVH traversal stack (`STACK` in trace.wgsl).
-pub(crate) const STACK: usize = 64;
 const KINDS: usize = DisplayKind::ALL.len();
 /// Bytes of the trace uniform: [`Head`] then 256 texture-set entries (`MAX_SETS` in trace.wgsl).
 const PARAMS_SIZE: u64 = (size_of::<Head>() + 256 * 16) as u64;
@@ -337,8 +335,8 @@ impl GpuTracer {
         let same_geometry = self.geometry.as_ref().is_some_and(|g| Arc::ptr_eq(&g.mesh, &scene.mesh) && g.tri_set == scene.tri_set);
         if !same_geometry {
             let nodes: Vec<(Vec3, Vec3, u32, u32)> = scene.bvh.nodes().collect();
-            if bvh_depth(&nodes).is_none_or(|d| d >= STACK) {
-                return Err("the mesh's BVH is too deep for GPU traversal".into());
+            if bvh_depth(&nodes).is_none() {
+                return Err("the mesh's BVH is malformed".into());
             }
             let (data, verts) = geometry_data(&scene.mesh, &scene.bvh, &scene.tri_set);
             let (nodes, tris) = data;
@@ -715,9 +713,10 @@ fn geometry_data(mesh: &Mesh, bvh: &texturecraft_geom::Bvh, tri_set: &[usize]) -
 }
 
 /// `bvh` in the layout of `shaders/rays.wgsl`, numbered from `base` (first node, first
-/// triangle) so several BVHs can share one buffer: per node (lo, first), (hi, count); per
-/// triangle (p0, w0), (p1, w1), (p2, w2), `last`, where `(w, last) = per_tri(original index)`.
-/// An empty BVH gets one leaf over one degenerate triangle.
+/// triangle) so several BVHs can share one buffer: per node (lo, first), (hi, count),
+/// (parent, _, _, _); per triangle (p0, w0), (p1, w1), (p2, w2), `last`, where
+/// `(w, last) = per_tri(original index)`. The root's parent is `u32::MAX`. An empty BVH gets
+/// one leaf over one degenerate triangle.
 pub(crate) fn bvh_rows(
     bvh: &texturecraft_geom::Bvh,
     (node_base, tri_base): (u32, u32),
@@ -725,11 +724,29 @@ pub(crate) fn bvh_rows(
 ) -> (Vec<[u32; 4]>, Vec<[u32; 4]>) {
     let (tris, order) = bvh.triangles();
     if tris.is_empty() {
-        return (vec![bits(Vec3::ZERO, tri_base), bits(Vec3::ZERO, 1)], vec![[0; 4]; 4]);
+        return (vec![bits(Vec3::ZERO, tri_base), bits(Vec3::ZERO, 1), [u32::MAX, 0, 0, 0]], vec![[0; 4]; 4]);
     }
-    let nodes = bvh
-        .nodes()
-        .flat_map(|(lo, hi, first, count)| [bits(lo, first.saturating_add(if count > 0 { tri_base } else { node_base })), bits(hi, count)])
+    let cpu: Vec<_> = bvh.nodes().collect();
+    let mut parent = vec![u32::MAX; cpu.len()];
+    for (index, &(_, _, first, count)) in cpu.iter().enumerate() {
+        if count == 0 {
+            let left = first as usize;
+            if let Some(slot) = parent.get_mut(left) {
+                *slot = index as u32;
+            }
+            if let Some(slot) = parent.get_mut(left.wrapping_add(1)) {
+                *slot = index as u32;
+            }
+        }
+    }
+    let nodes = cpu
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (lo, hi, first, count))| {
+            let link = first.saturating_add(if *count > 0 { tri_base } else { node_base });
+            let parent_gpu = parent.get(index).copied().filter(|p| *p != u32::MAX).and_then(|p| p.checked_add(node_base)).unwrap_or(u32::MAX);
+            [bits(*lo, link), bits(*hi, *count), [parent_gpu, 0, 0, 0]]
+        })
         .collect();
     let rows = tris
         .iter()
@@ -958,6 +975,24 @@ mod tests {
         }
         let cpu = 16.0 / t0.elapsed().as_secs_f64();
         eprintln!("1080p material ball: GPU {gpu:.0} samples/s, CPU {cpu:.1} samples/s, {:.1}x", gpu / cpu);
+    }
+
+    #[test]
+    fn bvh_rows_record_parent_links() {
+        let mesh = primitives::sphere(1.0, 8, 6);
+        let (nodes, _) = bvh_rows(&Bvh::new(&mesh), (4, 0), |_| ([0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!(nodes.len() % 3, 0);
+        let count = nodes.len() / 3;
+        assert!(count > 2);
+        assert_eq!(nodes[2][0], u32::MAX, "the root's parent");
+        for index in 1..count {
+            let parent = nodes[index * 3 + 2][0] as usize;
+            let parent_local = parent - 4;
+            assert!(parent_local < count && parent_local != index, "node {index} parent {parent}");
+            assert_eq!(nodes[parent_local * 3 + 1][3], 0, "a parent is an inner node");
+            let left = nodes[parent_local * 3][3] as usize;
+            assert!(index + 4 == left || index + 4 == left + 1, "node {index} is not a child of {parent_local}");
+        }
     }
 
     #[test]

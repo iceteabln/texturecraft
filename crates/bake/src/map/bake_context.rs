@@ -10,8 +10,6 @@ use texturecraft_core::{
 };
 use texturecraft_geom::{Hit, Surface, surface_at};
 
-const CURVATURE_CHUNK: usize = 1 << 15;
-
 pub(crate) struct BakeContext<'a> {
     low: Source<'a>,
     high: Option<Source<'a>>,
@@ -167,7 +165,9 @@ impl<'a> BakeContext<'a> {
                     ANY
                 }
             };
-            let chunk_size = CURVATURE_CHUNK.min((1_048_576 / rays_per_sample).max(1));
+            // Fill the tracer's ray batch. A short chunk here used to read the GPU back after
+            // every few dozen thousand samples, which at 4K × 8×8 is thousands of round trips.
+            let chunk_size = (scene.ray_batch() / rays_per_sample).min(scene.sample_batch()).max(1);
             for chunk in chosen.chunks(chunk_size) {
                 let mut rays: Vec<Ray> = bytemuck::zeroed_vec(chunk.len() * rays_per_sample);
                 rays.par_chunks_mut(rays_per_sample)

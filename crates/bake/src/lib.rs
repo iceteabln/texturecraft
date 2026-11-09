@@ -43,9 +43,6 @@ pub const MAX_RAYS: u32 = 4096;
 pub const MAX_TEXELS: u64 = 1 << 27;
 // Bound each supersampled G-buffer to roughly 200 MB
 const STRIP_TEXELS: usize = 1 << 24;
-const BATCH: usize = 1 << 18;
-// Curvature batches stay small so progress and cancellation remain responsive
-const CURVATURE_BATCH: usize = 1 << 15;
 
 fn validate(request: &BakeRequest) -> Result<(), BakeError> {
     let settings = request.settings;
@@ -209,8 +206,11 @@ fn bake_in_strips(
 
     let (sample_width, sample_height) = (width * samples_per_axis, height * samples_per_axis);
     let rows_per_strip = (strip_texels / (sample_width * samples_per_axis)).max(1).min(height);
-    let batch = if context.traces_curvature() { CURVATURE_BATCH } else { BATCH };
-    let rows_per_batch = (batch / (sample_width * samples_per_axis)).max(1);
+    // One output row holds `width × samples²` subsamples. The tracer says how many of those to
+    // cast before the next readback; a 4K 8×8 row is already 262144 samples, so a fixed 32768
+    // used to sync the GPU eight times per row.
+    let samples_per_row = sample_width.saturating_mul(samples_per_axis).max(1);
+    let rows_per_batch = (scene.sample_batch() / samples_per_row).max(1);
     let mut strip_mesh = Mesh { indices: request.mesh.indices.clone(), submeshes: request.mesh.submeshes.clone(), ..Mesh::default() };
     for strip_start in (0..height).step_by(rows_per_strip) {
         let rows = rows_per_strip.min(height - strip_start);
