@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelBlend, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask, MaskBackground,
-    Procedural, ProceduralKind, Projection, Source,
+    BakeResolution, BakedMap, BlendMode, Channel, ChannelBlend, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask,
+    MaskBackground, Procedural, ProceduralKind, Projection, Source,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, SubMesh};
@@ -73,10 +73,15 @@ pub fn open_project(path: &str) -> Result<Session> {
     session.doc.project.mesh_file = "scene.obj".into();
     let mut notes = Vec::new();
     import_stack(&mut session, &stack, &mut notes)?;
-    match texturecraft_projectfiles::decode_scene_maps(file, resolution) {
-        Ok(maps) => notes.push(format!("mesh maps: {}", import_mesh_maps(&mut session, &maps))),
-        Err(e) => notes.push(format!("mesh maps skipped: {e}")),
-    }
+    let imported = match texturecraft_projectfiles::decode_scene_maps(file, resolution) {
+        Ok(maps) => import_mesh_maps(&mut session, &maps),
+        Err(e) => {
+            notes.push(format!("mesh maps skipped: {e}"));
+            0
+        }
+    };
+    let baked_sets = bake_missing_maps(&mut session);
+    notes.push(format!("mesh maps: {imported} from the file, {baked_sets} texture set(s) baked"));
     match texturecraft_projectfiles::decode_texture_cache(file, resolution) {
         Ok(caches) => {
             let n = import_texture_cache(&mut session, &caches)?;
@@ -527,8 +532,10 @@ fn proc_source(proc: &SppProceduralChannel) -> Source {
 
 fn procedural_kind(pattern: &str) -> ProceduralKind {
     match pattern {
-        "clouds" | "perlin" => ProceduralKind::Clouds,
-        "cells" | "brick" => ProceduralKind::Cells,
+        "clouds" => ProceduralKind::Clouds,
+        "perlin" => ProceduralKind::Perlin,
+        "cells" => ProceduralKind::Cells,
+        "brick" => ProceduralKind::Bricks,
         "scratches" => ProceduralKind::Scratches,
         "wood_rings" => ProceduralKind::Wood,
         "stripes" => ProceduralKind::Stripes,
@@ -654,7 +661,8 @@ fn library_filter_kind(id: &str, amount: f32) -> EffectKind {
         "highPass" => Filter::HighPass { radius },
         "blurDirectional" => Filter::DirectionalBlur { radius, angle: 0.0 },
         "slopeBlur" => Filter::SlopeBlur { radius, scale: 4.0, seed: 1 },
-        "hsl" => Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: amount.clamp(-1.0, 1.0) },
+        // Hue, saturation and lightness are separate stored fields. The generic amount is not one of them.
+        "hsl" => Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: 0.0 },
         "invert" => Filter::Invert,
         _ => Filter::Sharpen { amount },
     };
@@ -680,7 +688,10 @@ fn fold_filter_layers(nodes: &[SppLayerNode]) -> Vec<SppLayerNode> {
 }
 
 fn filter_only(node: &SppLayerNode) -> bool {
-    node.kind != "folder"
+    // A hidden layer, or one whose mask starts black, must stay its own layer so the filter stays off.
+    node.visible
+        && !node.has_black_mask
+        && node.kind != "folder"
         && !node.content_filters.is_empty()
         && node.children.is_empty()
         && node.mask_effects.is_empty()
@@ -764,6 +775,56 @@ fn channel_of(name: &str) -> Option<Channel> {
         "opacity" => Some(Channel::Opacity),
         _ => None,
     }
+}
+
+/// Maps a project file bakes. Anything the file did not bring is baked from the project's own mesh.
+const FILE_MAPS: [BakedMap; 7] =
+    [BakedMap::Normal, BakedMap::WorldNormal, BakedMap::Id, BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Position, BakedMap::Thickness];
+
+/// Bake `FILE_MAPS` that are still empty, one texture set at a time, from the low poly. Returns how many sets were baked.
+fn bake_missing_maps(s: &mut Session) -> usize {
+    let mut baked = 0usize;
+    let count = s.doc.project.texture_sets.len();
+    for ts in 0..count {
+        let has_tiles = s.doc.project.texture_sets.get(ts).is_some_and(|set| !set.uv_tiles.is_empty());
+        if has_tiles {
+            s.log.push(format!("texture set {ts}: mesh maps stay as imported; a UV-tiled set is not baked on open"));
+            continue;
+        }
+        let present: BTreeSet<BakedMap> = s.doc.baked.get(&ts).map(|entry| entry.maps.keys().copied().collect()).unwrap_or_default();
+        let missing: Vec<BakedMap> = FILE_MAPS.into_iter().filter(|map| !present.contains(map)).collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let resolution = s
+            .doc
+            .baked
+            .get(&ts)
+            .filter(|entry| !entry.maps.is_empty())
+            .map(|entry| entry.resolution)
+            .or_else(|| s.doc.project.texture_sets.get(ts).map(|set| set.resolution))
+            .unwrap_or(128);
+        let Some(bake_resolution) = BakeResolution::from_pixels(resolution) else {
+            s.log.push(format!("texture set {ts}: mesh map bake skipped, resolution {resolution} is not a bake size"));
+            continue;
+        };
+        {
+            let Ok(set) = s.doc.project.texture_set_mut(ts) else { continue };
+            set.bake.common.resolution = bake_resolution;
+            set.bake.common.resolution_height = None;
+            set.bake.high_poly.use_low_as_high = true;
+            set.bake.maps.select(missing.iter().copied());
+        }
+        let outcome = s.bake_now(ts, true);
+        if let Ok(set) = s.doc.project.texture_set_mut(ts) {
+            set.bake.maps.select(FILE_MAPS);
+        }
+        match outcome {
+            Ok(_) => baked += 1,
+            Err(error) => s.log.push(format!("texture set {ts}: mesh map bake skipped: {error}")),
+        }
+    }
+    baked
 }
 
 fn import_mesh_maps(s: &mut Session, maps: &[CachedMeshMap]) -> usize {
@@ -942,6 +1003,36 @@ mod tests {
         assert_eq!(folded[0].name, "Base");
         assert_eq!(folded[0].content_filters.len(), 1);
         assert!(matches!(library_filter_kind("sharpen", 0.8), EffectKind::Filter(Filter::Sharpen { amount }) if (amount - 0.8).abs() < 1e-4));
+        assert!(matches!(library_filter_kind("hsl", 1.0), EffectKind::Filter(Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: 0.0 })));
+        assert!(matches!(procedural_kind("brick"), ProceduralKind::Bricks));
+        assert!(matches!(procedural_kind("perlin"), ProceduralKind::Perlin));
+        let mut hidden = empty_fill("Sharpen");
+        hidden.visible = false;
+        hidden.content_filters.push(SppContentFilter { name: "sharpen".into(), filter_id: "sharpen".into(), amount: 0.8 });
+        let kept = fold_filter_layers(&[empty_fill("Base"), hidden]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].content_filters.is_empty());
+        let mut masked = empty_fill("Sharpen");
+        masked.has_black_mask = true;
+        masked.content_filters.push(SppContentFilter { name: "sharpen".into(), filter_id: "sharpen".into(), amount: 0.8 });
+        let kept_mask = fold_filter_layers(&[empty_fill("Base"), masked]);
+        assert_eq!(kept_mask.len(), 2);
+        assert!(kept_mask[0].content_filters.is_empty());
+    }
+
+    #[test]
+    fn missing_mesh_maps_are_baked_once() {
+        let mut session = Session::new_project("ball", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let sets = session.doc.project.texture_sets.len();
+        assert_eq!(bake_missing_maps(&mut session), sets);
+        for ts in 0..sets {
+            let baked = &session.doc.baked[&ts];
+            assert_eq!(baked.resolution, 128);
+            assert!(baked.maps.contains_key(&BakedMap::Curvature));
+            assert!(baked.maps.contains_key(&BakedMap::AmbientOcclusion));
+            assert!(baked.maps.contains_key(&BakedMap::Thickness));
+        }
+        assert_eq!(bake_missing_maps(&mut session), 0);
     }
 
     fn env_file(key: &str) -> Option<std::path::PathBuf> {

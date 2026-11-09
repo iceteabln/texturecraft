@@ -156,7 +156,10 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
 fn load(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("material.load", "`path` is required"))?;
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if matches!(ext.as_str(), "spp" | "spsm" | "spmsk" | "sbsar") {
+    if ext == "spp" {
+        return Err(bad("material.load", "use file.open to open .spp projects"));
+    }
+    if matches!(ext.as_str(), "spsm" | "spmsk" | "sbsar") {
         return crate::project_import::dispatch(s, path, Place::from_params(p));
     }
     let bytes = std::fs::read(path).map_err(|e| bad("material.load", format!("cannot read {path}: {e}")))?;
@@ -172,4 +175,16 @@ fn save(_: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(target_arch = "wasm32")]
 fn load(_: &mut Session, _: &Value) -> Result<Value> {
     Err(EngineError::Other("file paths are not available in the browser".into()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_rejects_project_files() {
+        let mut session = Session::new_project("ball", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let err = load(&mut session, &serde_json::json!({ "path": "project.spp" })).unwrap_err();
+        assert!(err.to_string().contains("file.open"), "{err}");
+    }
 }

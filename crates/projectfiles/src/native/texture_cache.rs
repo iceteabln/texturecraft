@@ -461,6 +461,27 @@ fn lz4_decompress_block(src: &[u8], capacity: usize) -> Result<Vec<u8>, String> 
 /// - `0x805B` (`GL_RGBA16`) or 8 bytes/pixel: 16-bit unsigned integer RGBA (`u16` LE per channel)
 /// - `0x881A` (`GL_RGBA16F`): 16-bit float RGBA (`f16` LE per channel)
 /// - `0x8C43` (`GL_SRGB8_ALPHA8`) or `0x8058` (`GL_RGBA8`) or 4 bytes/pixel: 8-bit RGBA (`u8` per channel)
+fn source_covers(src: &[u8], w: u32, h: u32, bpp: usize) -> bool {
+    if w == 0 || h == 0 || bpp == 0 || w > 16_384 || h > 16_384 {
+        return false;
+    }
+    src.len() >= (w as usize) * (h as usize) * bpp
+}
+
+fn blank_u8(tw: u32, th: u32, comps: usize) -> Vec<u8> {
+    if tw == 0 || th == 0 || tw > 16_384 || th > 16_384 || comps == 0 || comps > 4 {
+        return Vec::new();
+    }
+    vec![0u8; tw as usize * th as usize * comps]
+}
+
+fn blank_f32(tw: u32, th: u32, comps: usize) -> Vec<f32> {
+    if tw == 0 || th == 0 || tw > 16_384 || th > 16_384 || comps == 0 || comps > 4 {
+        return Vec::new();
+    }
+    vec![0.0; tw as usize * th as usize * comps]
+}
+
 fn downsample_base_color(src: &[u8], w: u32, h: u32, tw: u32, th: u32, internal_format: u32) -> Vec<u8> {
     let bpp = src.len() / ((w as usize).saturating_mul(h as usize).max(1));
     if internal_format == 0x805B || (bpp == 8 && internal_format != 0x881A) {
@@ -481,6 +502,9 @@ fn linear_to_srgb_u8(x: f32) -> u8 {
 }
 
 fn downsample_rgba16_to_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    if !source_covers(src, w, h, 8) {
+        return blank_u8(tw, th, 4);
+    }
     let mut out = vec![0u8; (tw * th * 4) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -531,6 +555,9 @@ fn downsample_rgba16_to_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> V
 }
 
 fn downsample_rgba16f_to_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    if !source_covers(src, w, h, 8) {
+        return blank_u8(tw, th, 4);
+    }
     let mut out = vec![0u8; (tw * th * 4) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -578,6 +605,9 @@ fn downsample_rgba16f_to_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> 
 }
 
 fn downsample_rgba8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    if !source_covers(src, w, h, 4) {
+        return blank_u8(tw, th, 4);
+    }
     let mut out = vec![0u8; (tw * th * 4) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -686,6 +716,9 @@ fn downsample_ga(src: &[u8], w: u32, h: u32, tw: u32, th: u32, internal_format: 
 }
 
 fn downsample_ga16_to_ga8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    if !source_covers(src, w, h, 4) {
+        return blank_u8(tw, th, 2);
+    }
     let mut out = vec![0u8; (tw * th * 2) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -725,6 +758,9 @@ fn downsample_ga16_to_ga8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u
 }
 
 fn downsample_ga8(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    if !source_covers(src, w, h, 2) {
+        return blank_u8(tw, th, 2);
+    }
     let mut out = vec![0u8; (tw * th * 2) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -826,6 +862,9 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn downsample_rg16f_to_f32(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<f32> {
+    if !source_covers(src, w, h, 4) {
+        return blank_f32(tw, th, 1);
+    }
     let mut out = vec![0.0f32; (tw * th) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -860,6 +899,9 @@ fn downsample_rg16f_to_f32(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<
 }
 
 fn downsample_rgba16f_to_rgb_f32(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<f32> {
+    if !source_covers(src, w, h, 8) {
+        return blank_f32(tw, th, 3);
+    }
     let mut out = vec![0.0f32; (tw * th * 3) as usize];
     let sx = (w / tw).max(1) as usize;
     let sy = (h / th).max(1) as usize;
@@ -906,4 +948,15 @@ fn downsample_rgba16f_to_rgb_f32(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downsample_rgba16_to_rgba8;
+
+    #[test]
+    fn short_texture_buffer_does_not_panic() {
+        let out = downsample_rgba16_to_rgba8(&[0u8; 4], 65_535, 65_535, 1, 1);
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
 }

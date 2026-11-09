@@ -111,6 +111,11 @@ fn read_string(src: &mut Cursor<&[u8]>) -> Result<String, String> {
     if length == 0 {
         return Ok(String::new());
     }
+    // A hostile length must fail before the allocation. A failed allocation aborts the process.
+    const MAX_STRING: u32 = 16 * 1024 * 1024;
+    if length > MAX_STRING || length as usize > remaining_bytes(src) {
+        return Err(format!("string length {length} exceeds the remaining bytes"));
+    }
     let mut buf = vec![0u8; length as usize];
     src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading string".to_string())?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -141,7 +146,7 @@ fn parse_v11_type_def(src: &mut Cursor<&[u8]>, registry: &mut Vec<TypeDef>) -> R
         return Ok(registry[i].clone());
     }
     let name = read_string(src)?;
-    let member_count = read_u32(src)?;
+    let member_count = guard_count(remaining_bytes(src), read_u32(src)?)?;
     let mut members = Vec::new();
     for _ in 0..member_count {
         let m_name = read_string(src)?;
@@ -274,7 +279,7 @@ fn parse_v11_registry_table(src: &mut Cursor<&[u8]>, type_count: u32) -> Result<
             return Ok(None);
         }
         let name = read_string(src)?;
-        let member_count = read_u32(src)?;
+        let member_count = guard_count(remaining_bytes(src), read_u32(src)?)?;
         let mut members = Vec::new();
         for _ in 0..member_count {
             let m_name = read_string(src)?;
@@ -317,7 +322,7 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
         Ok(v)
     }
     fn name(d: &[u8], p: &mut usize, ln: usize) -> Result<String, String> {
-        if *p + ln > d.len() {
+        if !fits(d, *p, ln) {
             return Err("inline EOF".into());
         }
         let s = String::from_utf8_lossy(&d[*p..*p + ln]).into_owned();
@@ -338,11 +343,18 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
         Ok(Value::Primitive(tag as u32, v))
     }
 
-    fn val(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>) -> Result<Value, String> {
+    fn fits(d: &[u8], p: usize, len: usize) -> bool {
+        len <= d.len().saturating_sub(p)
+    }
+
+    fn val(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>, depth: u32) -> Result<Value, String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
         let tag = u8(d, p)?;
         if tag == 0x10 {
             let ln = u32(d, p)? as usize;
-            if *p + ln > d.len() {
+            if !fits(d, *p, ln) {
                 return Err("inline EOF".into());
             }
             let v = d[*p..*p + ln].to_vec();
@@ -350,28 +362,31 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
             return Ok(Value::String(v));
         }
         if tag == 0x12 || tag == 0x14 {
-            if d[*p] == 0xFF {
+            if d.get(*p) == Some(&0xFF) {
                 *p += 1;
                 return Ok(Value::Object(None));
             }
-            return Ok(Value::Object(Some(obj(d, p, sizes)?)));
+            return Ok(Value::Object(Some(obj(d, p, sizes, depth + 1)?)));
         }
         if tag == 0x13 || tag == 0x11 {
             u32(d, p)?;
             let c = u32(d, p)? as usize;
+            if c > MAX_ARRAY_ITEMS as usize {
+                return Err("inline array too large".into());
+            }
             let mut els = Vec::new();
             for _ in 0..c {
                 let e = u8(d, p)?;
                 if e == 0x12 || e == 0x14 {
-                    if d[*p] == 0xFF {
+                    if d.get(*p) == Some(&0xFF) {
                         *p += 1;
                         els.push(Value::Object(None));
                     } else {
-                        els.push(Value::Object(Some(obj(d, p, sizes)?)));
+                        els.push(Value::Object(Some(obj(d, p, sizes, depth + 1)?)));
                     }
                 } else if e == 0x10 {
                     let ln = u32(d, p)? as usize;
-                    if *p + ln > d.len() {
+                    if !fits(d, *p, ln) {
                         return Err("inline EOF".into());
                     }
                     els.push(Value::String(d[*p..*p + ln].to_vec()));
@@ -388,7 +403,10 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
         prim(d, p, tag, sizes)
     }
 
-    fn obj(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>) -> Result<UNode, String> {
+    fn obj(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>, depth: u32) -> Result<UNode, String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
         u8(d, p)?;
         u32(d, p)?;
         let name_len = u32(d, p)? as usize;
@@ -398,7 +416,7 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
         for _ in 0..fc {
             let field_len = u32(d, p)? as usize;
             let fn_ = name(d, p, field_len)?;
-            fields.push((fn_, val(d, p, sizes)?));
+            fields.push((fn_, val(d, p, sizes, depth + 1)?));
         }
         Ok(UNode { type_name: nm, fields })
     }
@@ -406,7 +424,7 @@ fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
     if u8(d, &mut p)? != 0x12 {
         return Err("inline stream does not start with root object".into());
     }
-    obj(d, &mut p, &sizes)
+    obj(d, &mut p, &sizes, 0)
 }
 
 fn inline_sizes() -> std::collections::HashMap<u8, usize> {
@@ -459,4 +477,33 @@ pub fn prim_int(val: &Value) -> Option<i64> {
 
 pub fn prim_bool(val: &Value) -> Option<bool> {
     prim_int(val).map(|i| i != 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_string_length_is_an_error() {
+        let mut raw = Vec::new();
+        raw.extend(u32::MAX.to_le_bytes());
+        let mut src = Cursor::new(raw.as_slice());
+        let err = read_string(&mut src).unwrap_err();
+        assert!(err.contains("string length"), "{err}");
+    }
+
+    #[test]
+    fn truncated_inline_object_does_not_panic() {
+        // 12-byte prefix, a root object with one field whose tag is an object at the last byte.
+        let mut raw = vec![0u8; 12];
+        raw.push(0x12);
+        raw.extend([0u8; 4]); // discarded flag
+        raw.extend(0u32.to_le_bytes()); // empty name
+        raw.extend(1u16.to_le_bytes()); // one field
+        raw.extend(0u32.to_le_bytes()); // empty field name
+        raw.push(0x12); // object tag with no following byte
+        let err = decode_inline(&raw).unwrap_err();
+        assert!(err.contains("EOF") || err.contains("recursion") || err.contains("object"), "{err}");
+    }
 }

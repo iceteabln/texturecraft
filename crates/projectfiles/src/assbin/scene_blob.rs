@@ -88,21 +88,23 @@ fn next_blob_start(bytes: &[u8], o: usize) -> Option<(usize, bool)> {
     find_blob_marker(bytes, o).map(|b| (b, false))
 }
 
-fn find_blob_marker(bytes: &[u8], from: usize) -> Option<usize> {
-    for o in from..bytes.len().saturating_sub(24) {
-        if read_u32(bytes, o).ok() != Some(0) {
-            continue;
-        }
-        let nlen = read_u32(bytes, o + 4).ok().unwrap_or(0) as usize;
-        if nlen < 4 || nlen > 48 || o + 8 + nlen > bytes.len() {
-            continue;
-        }
-        let name = &bytes[o + 8..o + 8 + nlen];
-        if name.iter().all(|&b| b == 0 || (32..127).contains(&b)) && name[0].is_ascii_graphic() {
-            return Some(o);
-        }
+fn marker_at(bytes: &[u8], o: usize) -> bool {
+    if read_u32(bytes, o).ok() != Some(0) {
+        return false;
     }
-    None
+    let Some(nlen_u) = read_u32(bytes, o + 4).ok() else {
+        return false;
+    };
+    let nlen = nlen_u as usize;
+    if !(4..=48).contains(&nlen) || o + 8 + nlen > bytes.len() {
+        return false;
+    }
+    let name = &bytes[o + 8..o + 8 + nlen];
+    name.iter().all(|&b| b == 0 || (32..127).contains(&b)) && name[0].is_ascii_graphic()
+}
+
+fn find_blob_marker(bytes: &[u8], from: usize) -> Option<usize> {
+    (from..bytes.len().saturating_sub(24)).find(|&o| marker_at(bytes, o))
 }
 
 fn parse_blob(bytes: &[u8], body: usize, end_limit: usize, scene_materials: &[String]) -> Result<Option<(ParsedMesh, usize)>, ImportError> {
@@ -132,8 +134,14 @@ fn parse_blob(bytes: &[u8], body: usize, end_limit: usize, scene_materials: &[St
     if num_vertices == 0 {
         return Err(ImportError::Assbin(format!("mesh {mesh_name}: zero vertices")));
     }
-
     let mut cursor = hdr + 16;
+    // Positions alone are 12 bytes each. Reject the count before `Vec::with_capacity`, which aborts if it cannot allocate.
+    const MAX_VERTICES: u32 = 5_000_000;
+    let position_bytes = (num_vertices as usize).saturating_mul(12);
+    if num_vertices > MAX_VERTICES || cursor.saturating_add(position_bytes) > end_limit {
+        return Err(ImportError::Assbin(format!("mesh {mesh_name}: vertex count {num_vertices} does not fit the blob")));
+    }
+
     let mut positions = Vec::with_capacity(num_vertices as usize);
     let mut normals = Vec::with_capacity(num_vertices as usize);
     let mut uvs = Vec::with_capacity(num_vertices as usize);
@@ -227,7 +235,7 @@ fn parse_blob(bytes: &[u8], body: usize, end_limit: usize, scene_materials: &[St
 
     let mut consumed = face_cursor;
     while consumed + 4 <= end_limit && read_u32(bytes, consumed).ok() == Some(0) {
-        if find_blob_marker(bytes, consumed) == Some(consumed) {
+        if marker_at(bytes, consumed) {
             break;
         }
         consumed += 4;
@@ -298,4 +306,32 @@ fn read_f32(bytes: &[u8], off: usize, end: usize) -> Result<f32, ImportError> {
         return Err(ImportError::Assbin("unexpected EOF".into()));
     }
     crate::pod::le_f32(bytes, off).ok_or_else(|| ImportError::Assbin("unexpected EOF".into()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_vertex_count_is_an_error() {
+        let mut bytes = vec![0u8; 28];
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(b"mesh");
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = parse_blob(&bytes, 0, bytes.len(), &[]).unwrap_err();
+        assert!(err.to_string().contains("vertex count"), "{err}");
+    }
+
+    #[test]
+    fn zero_padding_is_not_a_marker() {
+        let zeros = vec![0u8; 64 * 1024];
+        assert!(!marker_at(&zeros, 0));
+        let mut at = 0usize;
+        while at + 4 <= zeros.len() {
+            assert!(!marker_at(&zeros, at));
+            at += 4;
+        }
+    }
 }

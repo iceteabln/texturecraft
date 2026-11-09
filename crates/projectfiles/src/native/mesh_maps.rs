@@ -131,6 +131,14 @@ fn classify_mesh_map(path: &str) -> Option<(SceneMapKind, String, String)> {
     Some((kind, material, hash.to_string()))
 }
 
+fn dense_len(src_w: u32, src_h: u32, channels: u32) -> Result<usize, String> {
+    const MAX_CANVAS: u32 = 16_384;
+    if src_w == 0 || src_h == 0 || src_w > MAX_CANVAS || src_h > MAX_CANVAS || channels == 0 || channels > 4 {
+        return Err(format!("mesh map is {src_w}x{src_h}x{channels}, above the {MAX_CANVAS} canvas"));
+    }
+    Ok(src_w as usize * src_h as usize * channels as usize)
+}
+
 fn looks_like_ao(s: &str) -> bool {
     s.contains("umgebungsverdeck") || s.contains("ambient occlusion") || s.contains("ambient_occlusion") || s.contains("ao from")
 }
@@ -144,7 +152,7 @@ fn looks_like_world_normal(s: &str) -> bool {
 }
 
 fn looks_like_thickness(s: &str) -> bool {
-    s.contains("thickness") || s.contains("dicke-map") || s.contains("dicken-map")
+    s.contains("thickness") || s.contains("stärke") || s.contains("staerke") || s.contains("dicke-map") || s.contains("dicken-map")
 }
 
 fn looks_like_id(s: &str) -> bool {
@@ -167,7 +175,8 @@ fn decode_jp2_resource(raw: &[u8], max_res: u32) -> Result<(u32, u32, u32, Vec<f
     let channels = decoded[0].2.channels;
     let src_w = decoded.iter().map(|(x0, _, t)| x0 + t.width).max().unwrap_or(tw);
     let src_h = decoded.iter().map(|(_, y0, t)| y0 + t.height).max().unwrap_or(th);
-    let mut dense = vec![0.0f32; src_w as usize * src_h as usize * channels as usize];
+    let dense_len = dense_len(src_w, src_h, channels)?;
+    let mut dense = vec![0.0f32; dense_len];
     for (x0, y0, tile) in &decoded {
         if tile.width != tw || tile.height != th || tile.channels != channels {
             return Err("mesh map tile size mismatch".into());
@@ -364,6 +373,9 @@ mod tests {
         assert_eq!(nrm.0, SceneMapKind::Normal);
         let curv = classify_mesh_map("/Curvature A3E_bogie?version=d3aaf18460c9f2cd0a3bec005827c794a86da673").unwrap();
         assert_eq!(curv.0, SceneMapKind::Curvature);
-        assert!(classify_mesh_map("/Stärke-Map aus Mesh A3E_bogie?version=98bc327e81743fb6c3f9b6042cdb535ec2a2b0b4",).is_none());
+        let thickness = classify_mesh_map("/Stärke-Map aus Mesh A3E_bogie?version=98bc327e81743fb6c3f9b6042cdb535ec2a2b0b4").unwrap();
+        assert_eq!(thickness.0, SceneMapKind::Thickness);
+        assert_eq!(thickness.1, "A3E_bogie");
+        assert!(dense_len(65_535, 65_535, 4).is_err());
     }
 }

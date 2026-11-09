@@ -27,7 +27,7 @@ pub(crate) fn import_scene_v17(bytes: &[u8], header: &AssbinHeader) -> Result<su
         return Err(ImportError::Assbin("assbin 1.7: no mesh blobs decoded".into()));
     }
     let (root_name, instances) = match read_scene_graph_nodes(bytes, off, header) {
-        Ok((_, name, inst)) if inst.len() >= meshes.len() => (name, inst),
+        Ok((_, name, inst)) if inst.len() >= meshes.len() && inst.iter().all(|(_, index)| (*index as usize) < meshes.len()) => (name, inst),
         _ => {
             let instances = meshes.iter().enumerate().map(|(i, _)| (Mat4::IDENTITY, i as u32)).collect();
             ("Scene".to_string(), instances)
@@ -35,6 +35,9 @@ pub(crate) fn import_scene_v17(bytes: &[u8], header: &AssbinHeader) -> Result<su
     };
     scene_to_mesh(&root_name, &instances, &meshes)
 }
+
+const MAX_NODE_DEPTH: u32 = 64;
+const MAX_SCENE_NODES: u32 = 100_000;
 
 /// Flat assimp-style node (no per-node chunk wrapper in the reference format 1.7).
 fn read_node(
@@ -44,7 +47,13 @@ fn read_node(
     child_table_prelude: bool,
     parent_world: Mat4,
     graph_end: usize,
+    depth: u32,
+    visited: &mut u32,
 ) -> Result<(usize, String, Vec<(Mat4, u32)>, Vec<(Mat4, u32)>), ImportError> {
+    *visited = visited.saturating_add(1);
+    if depth > MAX_NODE_DEPTH || *visited > MAX_SCENE_NODES {
+        return Err(ImportError::Assbin("scene graph is too deep".into()));
+    }
     let (mut off, name) = if is_root { read_root_name(bytes, off)? } else { read_ai_string(bytes, off)? };
     let local = read_matrix(bytes, off)?;
     off += 64;
@@ -71,7 +80,7 @@ fn read_node(
         }
     }
     for _ in 0..num_children as usize {
-        let (child_off, _child_name, child_own, child_nested) = read_node(bytes, off, false, false, world, graph_end)?;
+        let (child_off, _child_name, child_own, child_nested) = read_node(bytes, off, false, false, world, graph_end, depth + 1, visited)?;
         off = child_off;
         child_instances.extend(child_own);
         child_instances.extend(child_nested);
@@ -107,7 +116,8 @@ fn read_scene_graph_nodes(bytes: &[u8], off: usize, header: &AssbinHeader) -> Re
         (0, off)
     };
     let graph_end = if block_len > 0 { off + block_len as usize } else { bytes.len() };
-    let (mut off, root_name, own, nested) = read_node(bytes, off, true, true, Mat4::IDENTITY, graph_end)?;
+    let mut visited = 0u32;
+    let (mut off, root_name, own, nested) = read_node(bytes, off, true, true, Mat4::IDENTITY, graph_end, 0, &mut visited)?;
     if graph_end > off && graph_end <= bytes.len() {
         off = graph_end;
     }
@@ -232,4 +242,20 @@ fn read_u16(bytes: &[u8], off: usize) -> Result<u16, ImportError> {
 
 fn read_f32(bytes: &[u8], off: usize) -> Result<f32, ImportError> {
     crate::pod::le_f32(bytes, off).ok_or_else(eof)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_scene_graph_is_an_error() {
+        let mut node = [0u8; 80];
+        node[68..72].copy_from_slice(&1u32.to_le_bytes());
+        let bytes = node.repeat(80);
+        let mut visited = 0u32;
+        let err = read_node(&bytes, 0, false, false, Mat4::IDENTITY, bytes.len(), 0, &mut visited).unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
 }
