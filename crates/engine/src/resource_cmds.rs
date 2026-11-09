@@ -62,11 +62,6 @@ impl Session {
         Ok(name)
     }
 
-    /// Store an image resource without its own undo step (a larger edit owns the change).
-    pub(crate) fn store_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        self.add_image_resource(file_name, bytes, u64::MAX)
-    }
-
     /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
     pub fn sync_images(&mut self) {
         let keep: Vec<String> = self.doc.resources.keys().cloned().collect();

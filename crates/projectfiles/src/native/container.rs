@@ -72,3 +72,33 @@ fn read_container_inner(spp: &Path, include_scene: bool) -> Result<SppContainer,
 fn read_dataset(file: &Hdf5File, path: &str) -> Result<Vec<u8>, String> {
     file.dataset(path).map_err(|e| format!("dataset '{path}': {e}"))?.read_raw_bytes().map_err(|e| format!("dataset '{path}' read: {e}"))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::stack::{SppLayerNode, SppStackFile};
+
+    fn count_generators(stack: &SppStackFile) -> usize {
+        stack.materials.iter().flat_map(|material| &material.texture_sets).map(|set| set.layers.iter().map(count_node).sum::<usize>()).sum()
+    }
+
+    fn count_node(node: &SppLayerNode) -> usize {
+        node.mask_effects.iter().filter(|effect| matches!(effect.kind, crate::stack::SppMaskEffectKind::Generator { .. })).count()
+            + node.children.iter().map(count_node).sum::<usize>()
+    }
+
+    #[test]
+    fn document_from_env_builds_a_layer_stack() {
+        let Ok(path) = std::env::var("TEXTURECRAFT_TEST_SPP") else { return };
+        let path = Path::new(&path);
+        if !path.is_file() {
+            return;
+        }
+        let container = read_container(path).unwrap();
+        let (stack, _, _) = crate::build_stack_from_document(&container.document_bin).unwrap();
+        let layers: usize = stack.materials.iter().flat_map(|material| &material.texture_sets).map(|set| set.layers.len()).sum();
+        assert!(layers > 0, "the project document has no layers");
+        assert!(count_generators(&stack) > 0, "the project document has no mask generators");
+    }
+}

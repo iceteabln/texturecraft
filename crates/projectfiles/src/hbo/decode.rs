@@ -1,4 +1,9 @@
-//! the reference format HBO decoder (registry v11+), ported from Universal-the reference format-Files `hbo_decode` / `_readers`.
+//! Reader for the layer document stored in a project, smart material or smart mask.
+//!
+//! The document is one binary tree of named records. A 12-byte header selects the layout:
+//! registry records share a type table, inline records carry their type name each time.
+//! This module only builds that tree. Mapping a record onto a TextureCraft layer, generator
+//! or filter happens in `stack`.
 
 use std::io::{Cursor, Read};
 
@@ -6,6 +11,8 @@ pub const MAGIC: u32 = 0x1B7C2FDD;
 
 const MAX_RECURSION: u32 = 128;
 const MAX_ARRAY_ITEMS: u32 = 1_000_000;
+const MAX_STRING: u32 = 16 * 1024 * 1024;
+const NEW_TYPE: u32 = 0xFFFF_FFFF;
 
 #[derive(Debug, Clone)]
 pub struct UNode {
@@ -18,7 +25,7 @@ pub enum Value {
     Object(Option<UNode>),
     Array(Vec<Value>),
     String(Vec<u8>),
-    /// HBO primitive type code (kept for parity with UPF decoder).
+    /// Numeric field. The code is the document's type tag; the bytes are little-endian.
     Primitive(#[allow(dead_code)] u32, Vec<u8>),
     Null,
 }
@@ -29,29 +36,9 @@ struct TypeDef {
     members: Vec<(String, u32)>,
 }
 
-fn primitive_sizes() -> std::collections::HashMap<u32, usize> {
-    [
-        (1, 4),
-        (2, 8),
-        (3, 12),
-        (4, 16),
-        (5, 4),
-        (6, 8),
-        (7, 12),
-        (8, 16),
-        (9, 4),
-        (10, 1),
-        (11, 4),
-        (12, 8),
-        (13, 36),
-        (14, 64),
-        (15, 8),
-        (16, 32),
-        (21, 8),
-        (22, 16),
-    ]
-    .into_iter()
-    .collect()
+struct Reader<'a> {
+    src: Cursor<&'a [u8]>,
+    types: Vec<TypeDef>,
 }
 
 pub fn read_header(raw: &[u8]) -> Option<(u32, u32, u32)> {
@@ -59,424 +46,384 @@ pub fn read_header(raw: &[u8]) -> Option<(u32, u32, u32)> {
         return None;
     }
     let magic = crate::pod::le_u32(raw, 0)?;
-    let vc = crate::pod::le_u32(raw, 4)?;
-    let dv = crate::pod::le_u32(raw, 8)?;
-    if magic != MAGIC {
-        return None;
-    }
-    Some((magic, vc, dv))
+    let layout = crate::pod::le_u32(raw, 4)?;
+    let version = crate::pod::le_u32(raw, 8)?;
+    (magic == MAGIC).then_some((magic, layout, version))
 }
 
 pub fn decode(raw: &[u8]) -> Result<(UNode, &'static str, u32), String> {
-    let (_, vc, dv) = read_header(raw).ok_or("not an HBO stream (bad magic or short)")?;
-    match vc {
-        0 => decode_inline(raw).map(|n| (n, "inline", dv)),
-        1 => decode_registry(raw).map(|n| (n, "registry", dv)),
-        _ => Err(format!("unknown HBO version_check {vc}")),
+    let (_, layout, version) = read_header(raw).ok_or("not an HBO stream (bad magic or short)")?;
+    match layout {
+        0 => read_inline(raw).map(|node| (node, "inline", version)),
+        1 => read_registry(raw).map(|node| (node, "registry", version)),
+        other => Err(format!("unknown HBO version_check {other}")),
     }
 }
 
-fn decode_registry(raw: &[u8]) -> Result<UNode, String> {
+fn read_registry(raw: &[u8]) -> Result<UNode, String> {
     if raw.len() < 12 {
         return Err("HBO too short".into());
     }
-    let mut src = Cursor::new(&raw[12..]);
-    let tag = read_u32(&mut src)?;
+    let mut reader = Reader { src: Cursor::new(&raw[12..]), types: Vec::new() };
+    let tag = reader.u32()?;
     if tag != 0x12 && tag != 0x13 {
         return Err("registry stream does not start with an object/root tag".into());
     }
-    let type_count = read_u32(&mut src)?;
-    let mut registry: Vec<TypeDef> = Vec::new();
-    if let Some(table) = parse_v11_registry_table(&mut src, type_count)? {
-        registry = table;
+    let type_count = reader.u32()?;
+    if let Some(table) = reader.type_table(type_count)? {
+        reader.types = table;
     }
-    let (name, fields) = parse_v11_object(&mut src, &mut registry, 0)?;
+    let (name, fields) = reader.record(0)?;
     Ok(UNode { type_name: name, fields })
 }
 
-fn read_u32(src: &mut Cursor<&[u8]>) -> Result<u32, String> {
-    let mut buf = [0u8; 4];
-    src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading u32".to_string())?;
-    Ok(u32::from_le_bytes(buf))
-}
+impl Reader<'_> {
+    fn u32(&mut self) -> Result<u32, String> {
+        let mut buf = [0u8; 4];
+        self.src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading u32".to_string())?;
+        Ok(u32::from_le_bytes(buf))
+    }
 
-fn read_u8(src: &mut Cursor<&[u8]>) -> Result<u8, String> {
-    let mut buf = [0u8; 1];
-    src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading u8".to_string())?;
-    Ok(buf[0])
-}
+    fn text(&mut self) -> Result<String, String> {
+        let length = self.u32()?;
+        if length == 0 {
+            return Ok(String::new());
+        }
+        // A hostile length must fail before the allocation. A failed allocation aborts the process.
+        if length > MAX_STRING || length as usize > self.remaining() {
+            return Err(format!("string length {length} exceeds the remaining bytes"));
+        }
+        let mut buf = vec![0u8; length as usize];
+        self.src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading string".to_string())?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
 
-fn read_string(src: &mut Cursor<&[u8]>) -> Result<String, String> {
-    let length = read_u32(src)?;
-    if length == 0 {
-        return Ok(String::new());
+    fn remaining(&self) -> usize {
+        self.src.get_ref().len().saturating_sub(self.src.position() as usize)
     }
-    // A hostile length must fail before the allocation. A failed allocation aborts the process.
-    const MAX_STRING: u32 = 16 * 1024 * 1024;
-    if length > MAX_STRING || length as usize > remaining_bytes(src) {
-        return Err(format!("string length {length} exceeds the remaining bytes"));
-    }
-    let mut buf = vec![0u8; length as usize];
-    src.read_exact(&mut buf).map_err(|_| "unexpected EOF reading string".to_string())?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
 
-fn guard_count(remaining: usize, count: u32) -> Result<u32, String> {
-    if count > MAX_ARRAY_ITEMS {
-        return Err(format!("array item count {count} exceeds limit {MAX_ARRAY_ITEMS}"));
+    fn count(&mut self) -> Result<u32, String> {
+        let count = self.u32()?;
+        if count > MAX_ARRAY_ITEMS {
+            return Err(format!("array item count {count} exceeds limit {MAX_ARRAY_ITEMS}"));
+        }
+        if count as usize > self.remaining() {
+            return Err(format!("array item count {count} exceeds remaining bytes {}", self.remaining()));
+        }
+        Ok(count)
     }
-    if count as usize > remaining {
-        return Err(format!("array item count {count} exceeds remaining bytes {remaining}"));
-    }
-    Ok(count)
-}
 
-fn remaining_bytes(src: &Cursor<&[u8]>) -> usize {
-    let pos = src.position() as usize;
-    src.get_ref().len() - pos
-}
+    fn bytes(&mut self, size: usize, what: &str) -> Result<Vec<u8>, String> {
+        let mut raw = vec![0u8; size];
+        self.src.read_exact(&mut raw).map_err(|_| format!("EOF reading {what}"))?;
+        Ok(raw)
+    }
 
-fn parse_v11_type_def(src: &mut Cursor<&[u8]>, registry: &mut Vec<TypeDef>) -> Result<TypeDef, String> {
-    let idx = read_u32(src)?;
-    if idx != 0xFFFF_FFFF {
-        let i = idx as usize;
-        if i >= registry.len() {
-            return Err(format!("type index out of range: {idx}"));
-        }
-        return Ok(registry[i].clone());
-    }
-    let name = read_string(src)?;
-    let member_count = guard_count(remaining_bytes(src), read_u32(src)?)?;
-    let mut members = Vec::new();
-    for _ in 0..member_count {
-        let m_name = read_string(src)?;
-        let m_type = read_u32(src)?;
-        members.push((m_name, m_type));
-    }
-    let type_def = TypeDef { name, members };
-    registry.push(type_def.clone());
-    Ok(type_def)
-}
-
-fn parse_v11_object(src: &mut Cursor<&[u8]>, registry: &mut Vec<TypeDef>, depth: u32) -> Result<(String, Vec<(String, Value)>), String> {
-    if depth > MAX_RECURSION {
-        return Err("max recursion depth exceeded".into());
-    }
-    let flag = read_u32(src)?;
-    if flag == 0 {
-        return Ok((String::new(), Vec::new()));
-    }
-    let type_def = parse_v11_type_def(src, registry)?;
-    parse_v11_object_with_def(src, registry, &type_def, depth)
-}
-
-fn parse_v11_object_with_def(
-    src: &mut Cursor<&[u8]>,
-    registry: &mut Vec<TypeDef>,
-    type_def: &TypeDef,
-    depth: u32,
-) -> Result<(String, Vec<(String, Value)>), String> {
-    let mut fields = Vec::new();
-    for (m_name, m_type) in &type_def.members {
-        let value = parse_v11_value(src, *m_type, registry, depth + 1)?;
-        fields.push((m_name.clone(), value));
-    }
-    Ok((type_def.name.clone(), fields))
-}
-
-fn parse_v11_value(src: &mut Cursor<&[u8]>, type_code: u32, registry: &mut Vec<TypeDef>, depth: u32) -> Result<Value, String> {
-    if depth > MAX_RECURSION {
-        return Err("max recursion depth exceeded".into());
-    }
-    let sizes = primitive_sizes();
-    match type_code {
-        0x12 | 0x14 => {
-            let (name, fields) = parse_v11_object(src, registry, depth)?;
-            if name.is_empty() && fields.is_empty() { Ok(Value::Object(None)) } else { Ok(Value::Object(Some(UNode { type_name: name, fields }))) }
-        }
-        0x13 => {
-            let count = guard_count(remaining_bytes(src), read_u32(src)?)?;
-            let mut values = Vec::new();
-            for _ in 0..count {
-                let start = src.position();
-                let (name, fields) = parse_v11_object(src, registry, depth + 1)?;
-                if src.position() == start {
-                    return Err("no progress while parsing v11 array (0x13)".into());
-                }
-                if name.is_empty() && fields.is_empty() {
-                    values.push(Value::Object(None));
-                } else {
-                    values.push(Value::Object(Some(UNode { type_name: name, fields })));
-                }
-            }
-            Ok(Value::Array(values))
-        }
-        0x11 => {
-            let count = guard_count(remaining_bytes(src), read_u32(src)?)?;
-            let mut values = Vec::new();
-            if count > 0 {
-                let elem_def = parse_v11_type_def(src, registry)?;
-                for _ in 0..count {
-                    let start = src.position();
-                    let (name, fields) = parse_v11_object_with_def(src, registry, &elem_def, depth + 1)?;
-                    if src.position() == start {
-                        return Err("no progress while parsing v11 array (0x11)".into());
-                    }
-                    values.push(Value::Object(Some(UNode { type_name: name, fields })));
-                }
-            }
-            Ok(Value::Array(values))
-        }
-        0x10 => {
-            let s = read_string(src)?;
-            Ok(Value::String(s.into_bytes()))
-        }
-        0x0A => Ok(Value::Primitive(0x0A, vec![read_u8(src)?])),
-        0x09 => {
-            let mut raw = [0u8; 4];
-            src.read_exact(&mut raw).map_err(|_| "EOF reading type 9".to_string())?;
-            Ok(Value::Primitive(0x09, raw.to_vec()))
-        }
-        0x0F => {
-            let mut raw = [0u8; 8];
-            src.read_exact(&mut raw).map_err(|_| "EOF reading type 15".to_string())?;
-            Ok(Value::Primitive(0x0F, raw.to_vec()))
-        }
-        0x15 => {
-            let mut raw = [0u8; 8];
-            src.read_exact(&mut raw).map_err(|_| "EOF reading type 21".to_string())?;
-            Ok(Value::Primitive(0x15, raw.to_vec()))
-        }
-        _ => {
-            let size = sizes.get(&type_code).copied().unwrap_or(0);
-            if size > 0 {
-                let mut raw = vec![0u8; size];
-                src.read_exact(&mut raw).map_err(|_| "EOF reading primitive".to_string())?;
-                Ok(Value::Primitive(type_code, raw))
-            } else {
-                Err(format!("unhandled v11 type code: {type_code}"))
-            }
-        }
-    }
-}
-
-fn parse_v11_registry_table(src: &mut Cursor<&[u8]>, type_count: u32) -> Result<Option<Vec<TypeDef>>, String> {
-    if type_count <= 0 {
-        return Ok(None);
-    }
-    let start = src.position();
-    let first = read_u32(src)?;
-    if first != 0xFFFF_FFFF {
-        src.set_position(start);
-        return Ok(None);
-    }
-    src.set_position(start);
-    let mut registry = Vec::new();
-    for _ in 0..type_count {
-        let idx = read_u32(src)?;
-        if idx != 0xFFFF_FFFF {
-            src.set_position(start);
+    fn type_table(&mut self, type_count: u32) -> Result<Option<Vec<TypeDef>>, String> {
+        if type_count == 0 {
             return Ok(None);
         }
-        let name = read_string(src)?;
-        let member_count = guard_count(remaining_bytes(src), read_u32(src)?)?;
+        let start = self.src.position();
+        let mut table = Vec::new();
+        for _ in 0..type_count {
+            if self.u32()? != NEW_TYPE {
+                self.src.set_position(start);
+                return Ok(None);
+            }
+            let name = self.text()?;
+            let member_count = self.count()?;
+            let mut members = Vec::new();
+            for _ in 0..member_count {
+                members.push((self.text()?, self.u32()?));
+            }
+            table.push(TypeDef { name, members });
+        }
+        Ok(Some(table))
+    }
+
+    fn record(&mut self, depth: u32) -> Result<(String, Vec<(String, Value)>), String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
+        if self.u32()? == 0 {
+            return Ok((String::new(), Vec::new()));
+        }
+        let def = self.type_def()?;
+        self.fields(&def, depth)
+    }
+
+    fn type_def(&mut self) -> Result<TypeDef, String> {
+        let index = self.u32()?;
+        if index != NEW_TYPE {
+            return self.types.get(index as usize).cloned().ok_or_else(|| format!("type index out of range: {index}"));
+        }
+        let name = self.text()?;
+        let member_count = self.count()?;
         let mut members = Vec::new();
         for _ in 0..member_count {
-            let m_name = read_string(src)?;
-            let m_type = read_u32(src)?;
-            members.push((m_name, m_type));
+            members.push((self.text()?, self.u32()?));
         }
-        registry.push(TypeDef { name, members });
+        let def = TypeDef { name, members };
+        self.types.push(def.clone());
+        Ok(def)
     }
-    Ok(Some(registry))
+
+    fn fields(&mut self, def: &TypeDef, depth: u32) -> Result<(String, Vec<(String, Value)>), String> {
+        let mut fields = Vec::new();
+        for (name, code) in &def.members {
+            fields.push((name.clone(), self.value(*code, depth + 1)?));
+        }
+        Ok((def.name.clone(), fields))
+    }
+
+    fn value(&mut self, code: u32, depth: u32) -> Result<Value, String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
+        match code {
+            0x12 | 0x14 => {
+                let (name, fields) = self.record(depth)?;
+                if name.is_empty() && fields.is_empty() { Ok(Value::Object(None)) } else { Ok(Value::Object(Some(UNode { type_name: name, fields }))) }
+            }
+            0x13 => self.record_list(depth),
+            0x11 => self.typed_list(depth),
+            0x10 => Ok(Value::String(self.text()?.into_bytes())),
+            other => {
+                let Some(size) = registry_width(other) else {
+                    return Err(format!("unhandled v11 type code: {other}"));
+                };
+                Ok(Value::Primitive(other, self.bytes(size, "primitive")?))
+            }
+        }
+    }
+
+    fn record_list(&mut self, depth: u32) -> Result<Value, String> {
+        let count = self.count()?;
+        let mut values = Vec::new();
+        for _ in 0..count {
+            let start = self.src.position();
+            let (name, fields) = self.record(depth + 1)?;
+            if self.src.position() == start {
+                return Err("no progress while parsing v11 array (0x13)".into());
+            }
+            if name.is_empty() && fields.is_empty() {
+                values.push(Value::Object(None));
+            } else {
+                values.push(Value::Object(Some(UNode { type_name: name, fields })));
+            }
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn typed_list(&mut self, depth: u32) -> Result<Value, String> {
+        let count = self.count()?;
+        let mut values = Vec::new();
+        if count > 0 {
+            let def = self.type_def()?;
+            for _ in 0..count {
+                let start = self.src.position();
+                let (name, fields) = self.fields(&def, depth + 1)?;
+                if self.src.position() == start {
+                    return Err("no progress while parsing v11 array (0x11)".into());
+                }
+                values.push(Value::Object(Some(UNode { type_name: name, fields })));
+            }
+        }
+        Ok(Value::Array(values))
+    }
 }
 
-fn decode_inline(raw: &[u8]) -> Result<UNode, String> {
-    // Minimal inline parser for tests; the reference format 11 uses registry.
-    let sizes = inline_sizes();
-    let d = raw;
-    let mut p = 12usize;
+/// Byte width of a numeric registry field. Record, list and text tags are not numeric.
+fn registry_width(code: u32) -> Option<usize> {
+    Some(match code {
+        1 | 5 | 9 | 11 => 4,
+        2 | 6 | 12 | 15 | 21 => 8,
+        3 | 7 => 12,
+        4 | 8 => 16,
+        10 => 1,
+        13 => 36,
+        14 => 64,
+        16 => 32,
+        22 => 16,
+        _ => return None,
+    })
+}
 
-    fn u8(d: &[u8], p: &mut usize) -> Result<u8, String> {
-        if *p >= d.len() {
-            return Err("inline EOF".into());
-        }
-        let v = d[*p];
-        *p += 1;
-        Ok(v)
-    }
-    fn u16(d: &[u8], p: &mut usize) -> Result<u16, String> {
-        if *p + 2 > d.len() {
-            return Err("inline EOF".into());
-        }
-        let v = crate::pod::le_u16(d, *p).ok_or("inline EOF")?;
-        *p += 2;
-        Ok(v)
-    }
-    fn u32(d: &[u8], p: &mut usize) -> Result<u32, String> {
-        if *p + 4 > d.len() {
-            return Err("inline EOF".into());
-        }
-        let v = crate::pod::le_u32(d, *p).ok_or("inline EOF")?;
-        *p += 4;
-        Ok(v)
-    }
-    fn name(d: &[u8], p: &mut usize, ln: usize) -> Result<String, String> {
-        if !fits(d, *p, ln) {
-            return Err("inline EOF".into());
-        }
-        let s = String::from_utf8_lossy(&d[*p..*p + ln]).into_owned();
-        *p += ln;
-        Ok(s)
-    }
-
-    fn prim(d: &[u8], p: &mut usize, tag: u8, sizes: &std::collections::HashMap<u8, usize>) -> Result<Value, String> {
-        let sz = sizes.get(&tag).copied().unwrap_or(0);
-        if sz == 0 {
-            return Err(format!("unknown inline primitive {tag}"));
-        }
-        if *p + sz > d.len() {
-            return Err("inline EOF".into());
-        }
-        let v = d[*p..*p + sz].to_vec();
-        *p += sz;
-        Ok(Value::Primitive(tag as u32, v))
-    }
-
-    fn fits(d: &[u8], p: usize, len: usize) -> bool {
-        len <= d.len().saturating_sub(p)
-    }
-
-    fn val(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>, depth: u32) -> Result<Value, String> {
-        if depth > MAX_RECURSION {
-            return Err("max recursion depth exceeded".into());
-        }
-        let tag = u8(d, p)?;
-        if tag == 0x10 {
-            let ln = u32(d, p)? as usize;
-            if !fits(d, *p, ln) {
-                return Err("inline EOF".into());
-            }
-            let v = d[*p..*p + ln].to_vec();
-            *p += ln;
-            return Ok(Value::String(v));
-        }
-        if tag == 0x12 || tag == 0x14 {
-            if d.get(*p) == Some(&0xFF) {
-                *p += 1;
-                return Ok(Value::Object(None));
-            }
-            return Ok(Value::Object(Some(obj(d, p, sizes, depth + 1)?)));
-        }
-        if tag == 0x13 || tag == 0x11 {
-            u32(d, p)?;
-            let c = u32(d, p)? as usize;
-            if c > MAX_ARRAY_ITEMS as usize {
-                return Err("inline array too large".into());
-            }
-            let mut els = Vec::new();
-            for _ in 0..c {
-                let e = u8(d, p)?;
-                if e == 0x12 || e == 0x14 {
-                    if d.get(*p) == Some(&0xFF) {
-                        *p += 1;
-                        els.push(Value::Object(None));
-                    } else {
-                        els.push(Value::Object(Some(obj(d, p, sizes, depth + 1)?)));
-                    }
-                } else if e == 0x10 {
-                    let ln = u32(d, p)? as usize;
-                    if !fits(d, *p, ln) {
-                        return Err("inline EOF".into());
-                    }
-                    els.push(Value::String(d[*p..*p + ln].to_vec()));
-                    *p += ln;
-                } else {
-                    els.push(prim(d, p, e, sizes)?);
-                }
-            }
-            return Ok(Value::Array(els));
-        }
-        if tag == 0x00 {
-            return Ok(Value::Null);
-        }
-        prim(d, p, tag, sizes)
-    }
-
-    fn obj(d: &[u8], p: &mut usize, sizes: &std::collections::HashMap<u8, usize>, depth: u32) -> Result<UNode, String> {
-        if depth > MAX_RECURSION {
-            return Err("max recursion depth exceeded".into());
-        }
-        u8(d, p)?;
-        u32(d, p)?;
-        let name_len = u32(d, p)? as usize;
-        let nm = name(d, p, name_len)?;
-        let fc = u16(d, p)? as usize;
-        let mut fields = Vec::new();
-        for _ in 0..fc {
-            let field_len = u32(d, p)? as usize;
-            let fn_ = name(d, p, field_len)?;
-            fields.push((fn_, val(d, p, sizes, depth + 1)?));
-        }
-        Ok(UNode { type_name: nm, fields })
-    }
-
-    if u8(d, &mut p)? != 0x12 {
+fn read_inline(raw: &[u8]) -> Result<UNode, String> {
+    let mut inline = Inline { data: raw, pos: 12 };
+    if inline.u8()? != 0x12 {
         return Err("inline stream does not start with root object".into());
     }
-    obj(d, &mut p, &sizes, 0)
+    inline.record(0)
 }
 
-fn inline_sizes() -> std::collections::HashMap<u8, usize> {
-    // Subset from UPF primitive_sizes.json "inline" — extend when needed.
-    [(1u8, 1), (2, 2), (3, 4), (4, 4), (5, 8), (6, 8), (7, 4), (8, 1), (9, 4), (10, 8), (11, 4), (12, 8), (13, 36), (14, 64), (15, 8)].into_iter().collect()
+struct Inline<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Inline<'a> {
+    fn u8(&mut self) -> Result<u8, String> {
+        let value = *self.data.get(self.pos).ok_or("inline EOF")?;
+        self.pos += 1;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        let value = crate::pod::le_u16(self.data, self.pos).ok_or("inline EOF")?;
+        self.pos += 2;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let value = crate::pod::le_u32(self.data, self.pos).ok_or("inline EOF")?;
+        self.pos += 4;
+        Ok(value)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(len).filter(|end| *end <= self.data.len()).ok_or("inline EOF")?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn name(&mut self, len: usize) -> Result<String, String> {
+        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+    }
+
+    fn number(&mut self, tag: u8) -> Result<Value, String> {
+        let Some(size) = inline_width(tag) else {
+            return Err(format!("unknown inline primitive {tag}"));
+        };
+        Ok(Value::Primitive(u32::from(tag), self.take(size)?.to_vec()))
+    }
+
+    fn value(&mut self, depth: u32) -> Result<Value, String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
+        match self.u8()? {
+            0x10 => {
+                let len = self.u32()? as usize;
+                Ok(Value::String(self.take(len)?.to_vec()))
+            }
+            0x12 | 0x14 => self.maybe_record(depth),
+            0x13 | 0x11 => self.list(depth),
+            0x00 => Ok(Value::Null),
+            tag => self.number(tag),
+        }
+    }
+
+    fn maybe_record(&mut self, depth: u32) -> Result<Value, String> {
+        if self.data.get(self.pos) == Some(&0xFF) {
+            self.pos += 1;
+            return Ok(Value::Object(None));
+        }
+        Ok(Value::Object(Some(self.record(depth + 1)?)))
+    }
+
+    fn list(&mut self, depth: u32) -> Result<Value, String> {
+        let _ = self.u32()?;
+        let count = self.u32()? as usize;
+        if count > MAX_ARRAY_ITEMS as usize {
+            return Err("inline array too large".into());
+        }
+        let mut items = Vec::new();
+        for _ in 0..count {
+            match self.u8()? {
+                0x12 | 0x14 => items.push(self.maybe_record(depth)?),
+                0x10 => {
+                    let len = self.u32()? as usize;
+                    items.push(Value::String(self.take(len)?.to_vec()));
+                }
+                tag => items.push(self.number(tag)?),
+            }
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn record(&mut self, depth: u32) -> Result<UNode, String> {
+        if depth > MAX_RECURSION {
+            return Err("max recursion depth exceeded".into());
+        }
+        let _ = self.u8()?;
+        let _ = self.u32()?;
+        let type_len = self.u32()? as usize;
+        let type_name = self.name(type_len)?;
+        let field_count = self.u16()? as usize;
+        let mut fields = Vec::new();
+        for _ in 0..field_count {
+            let field_len = self.u32()? as usize;
+            let field_name = self.name(field_len)?;
+            fields.push((field_name, self.value(depth + 1)?));
+        }
+        Ok(UNode { type_name, fields })
+    }
+}
+
+fn inline_width(tag: u8) -> Option<usize> {
+    Some(match tag {
+        1 | 8 => 1,
+        2 => 2,
+        3 | 4 | 7 | 9 | 11 => 4,
+        5 | 6 | 10 | 12 | 15 => 8,
+        13 => 36,
+        14 => 64,
+        _ => return None,
+    })
 }
 
 pub fn field<'a>(node: &'a UNode, name: &str) -> Option<&'a Value> {
-    node.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    node.fields.iter().find(|(found, _)| found == name).map(|(_, value)| value)
 }
 
 pub fn object_val(val: &Value) -> Option<&UNode> {
     match val {
-        Value::Object(Some(n)) => Some(n),
+        Value::Object(Some(node)) => Some(node),
         _ => None,
     }
 }
 
 pub fn array_items(val: &Value) -> &[Value] {
     match val {
-        Value::Array(a) => a.as_slice(),
+        Value::Array(items) => items.as_slice(),
         _ => &[],
     }
 }
 
 pub fn string_val(val: &Value) -> Option<String> {
     match val {
-        Value::String(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        Value::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
         _ => None,
     }
 }
 
 pub fn prim_bytes(val: &Value) -> Option<&[u8]> {
     match val {
-        Value::Primitive(_, b) => Some(b.as_slice()),
+        Value::Primitive(_, bytes) => Some(bytes.as_slice()),
         _ => None,
     }
 }
 
 pub fn prim_int(val: &Value) -> Option<i64> {
-    let b = prim_bytes(val)?;
-    match b.len() {
-        1 => Some(b[0] as i8 as i64),
-        2 => crate::pod::le_i16(b, 0).map(|v| v as i64),
-        4 => crate::pod::le_i32(b, 0).map(|v| v as i64),
-        8 => crate::pod::le_i64(b, 0),
-        _ => Some(i64::from_le_bytes(b.get(..8).unwrap_or(b).try_into().unwrap_or([0; 8]))),
+    let bytes = prim_bytes(val)?;
+    match bytes.len() {
+        1 => Some(bytes[0] as i8 as i64),
+        2 => crate::pod::le_i16(bytes, 0).map(|value| value as i64),
+        4 => crate::pod::le_i32(bytes, 0).map(|value| value as i64),
+        8 => crate::pod::le_i64(bytes, 0),
+        _ => {
+            let mut wide = [0u8; 8];
+            let n = bytes.len().min(8);
+            wide[..n].copy_from_slice(&bytes[..n]);
+            Some(i64::from_le_bytes(wide))
+        }
     }
 }
 
 pub fn prim_bool(val: &Value) -> Option<bool> {
-    prim_int(val).map(|i| i != 0)
+    prim_int(val).map(|value| value != 0)
 }
 
 #[cfg(test)]
@@ -486,10 +433,9 @@ mod tests {
 
     #[test]
     fn hostile_string_length_is_an_error() {
-        let mut raw = Vec::new();
-        raw.extend(u32::MAX.to_le_bytes());
-        let mut src = Cursor::new(raw.as_slice());
-        let err = read_string(&mut src).unwrap_err();
+        let raw = u32::MAX.to_le_bytes();
+        let mut reader = Reader { src: Cursor::new(raw.as_slice()), types: Vec::new() };
+        let err = reader.text().unwrap_err();
         assert!(err.contains("string length"), "{err}");
     }
 
@@ -498,12 +444,12 @@ mod tests {
         // 12-byte prefix, a root object with one field whose tag is an object at the last byte.
         let mut raw = vec![0u8; 12];
         raw.push(0x12);
-        raw.extend([0u8; 4]); // discarded flag
-        raw.extend(0u32.to_le_bytes()); // empty name
-        raw.extend(1u16.to_le_bytes()); // one field
-        raw.extend(0u32.to_le_bytes()); // empty field name
-        raw.push(0x12); // object tag with no following byte
-        let err = decode_inline(&raw).unwrap_err();
+        raw.extend([0u8; 4]);
+        raw.extend(0u32.to_le_bytes());
+        raw.extend(1u16.to_le_bytes());
+        raw.extend(0u32.to_le_bytes());
+        raw.push(0x12);
+        let err = read_inline(&raw).unwrap_err();
         assert!(err.contains("EOF") || err.contains("recursion") || err.contains("object"), "{err}");
     }
 }

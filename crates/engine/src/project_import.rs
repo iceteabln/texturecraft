@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde_json::{Value, json};
 use texturecraft_core::{
@@ -12,8 +11,7 @@ use texturecraft_core::{
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, SubMesh};
 use texturecraft_projectfiles::{
-    CachedMaterialChannels, CachedMeshMap, SceneMapKind, SceneMesh, SppChannelBlend, SppContentEffect, SppContentFilter, SppLayerNode, SppMaskEffect,
-    SppMaskEffectKind, SppProceduralChannel, SppStackFile,
+    SceneMesh, SppChannelBlend, SppContentEffect, SppContentFilter, SppLayerNode, SppMaskEffect, SppMaskEffectKind, SppProceduralChannel, SppStackFile,
 };
 
 use crate::commands::{CommandSpec, always, bad, strp};
@@ -60,7 +58,7 @@ fn stem_of(path: &str) -> String {
     Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Project").to_string()
 }
 
-/// A new session from a `.spp` (mesh, layer stack, generators, baked mesh maps, texture cache).
+/// A new session from a `.spp`: mesh, layer stack and generators. Mesh maps are baked here.
 pub fn open_project(path: &str) -> Result<Session> {
     let file = Path::new(path);
     let container = texturecraft_projectfiles::read_container(file).map_err(EngineError::Other)?;
@@ -73,24 +71,8 @@ pub fn open_project(path: &str) -> Result<Session> {
     session.doc.project.mesh_file = "scene.obj".into();
     let mut notes = Vec::new();
     import_stack(&mut session, &stack, &mut notes)?;
-    let imported = match texturecraft_projectfiles::decode_scene_maps(file, resolution) {
-        Ok(maps) => import_mesh_maps(&mut session, &maps),
-        Err(e) => {
-            notes.push(format!("mesh maps skipped: {e}"));
-            0
-        }
-    };
     let baked_sets = bake_missing_maps(&mut session);
-    notes.push(format!("mesh maps: {imported} from the file, {baked_sets} texture set(s) baked"));
-    match texturecraft_projectfiles::decode_texture_cache(file, resolution) {
-        Ok(caches) => {
-            let n = import_texture_cache(&mut session, &caches)?;
-            if n > 0 {
-                notes.push(format!("texture cache on {n} texture set(s) — hide \"Texture cache\" to edit the stack underneath"));
-            }
-        }
-        Err(e) => notes.push(format!("texture cache skipped: {e}")),
-    }
+    notes.push(format!("mesh maps: {baked_sets} texture set(s) baked"));
     session.sync_images();
     for cache in &mut session.caches {
         cache.invalidate_all();
@@ -777,7 +759,7 @@ fn channel_of(name: &str) -> Option<Channel> {
     }
 }
 
-/// Maps a project file bakes. Anything the file did not bring is baked from the project's own mesh.
+/// Mesh maps baked from the project's own mesh when a project is opened.
 const FILE_MAPS: [BakedMap; 7] =
     [BakedMap::Normal, BakedMap::WorldNormal, BakedMap::Id, BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Position, BakedMap::Thickness];
 
@@ -788,7 +770,7 @@ fn bake_missing_maps(s: &mut Session) -> usize {
     for ts in 0..count {
         let has_tiles = s.doc.project.texture_sets.get(ts).is_some_and(|set| !set.uv_tiles.is_empty());
         if has_tiles {
-            s.log.push(format!("texture set {ts}: mesh maps stay as imported; a UV-tiled set is not baked on open"));
+            s.log.push(format!("texture set {ts}: a UV-tiled set is not baked on open"));
             continue;
         }
         let present: BTreeSet<BakedMap> = s.doc.baked.get(&ts).map(|entry| entry.maps.keys().copied().collect()).unwrap_or_default();
@@ -826,119 +808,6 @@ fn bake_missing_maps(s: &mut Session) -> usize {
         }
     }
     baked
-}
-
-fn import_mesh_maps(s: &mut Session, maps: &[CachedMeshMap]) -> usize {
-    let mut applied = 0usize;
-    for map in maps {
-        let Some(kind) = baked_kind(map.kind) else { continue };
-        let Some(ts) = s.doc.project.texture_sets.iter().position(|set| set.name.eq_ignore_ascii_case(&map.material_name)) else { continue };
-        let Some(data) = pack_map(kind, map) else { continue };
-        let entry = s.doc.baked.entry(ts).or_default();
-        if entry.maps.is_empty() {
-            entry.resolution = map.width;
-        }
-        if entry.resolution != map.width {
-            continue;
-        }
-        entry.maps.insert(kind, Arc::new(data));
-        if let Ok(set) = s.doc.project.texture_set_mut(ts) {
-            set.baked.insert(kind);
-        }
-        applied += 1;
-    }
-    applied
-}
-
-fn baked_kind(kind: SceneMapKind) -> Option<BakedMap> {
-    Some(match kind {
-        SceneMapKind::Normal => BakedMap::Normal,
-        SceneMapKind::WorldSpaceNormal => BakedMap::WorldNormal,
-        SceneMapKind::Id => BakedMap::Id,
-        SceneMapKind::AmbientOcclusion => BakedMap::AmbientOcclusion,
-        SceneMapKind::Curvature => BakedMap::Curvature,
-        SceneMapKind::Position => BakedMap::Position,
-        SceneMapKind::Thickness => BakedMap::Thickness,
-    })
-}
-
-fn pack_map(kind: BakedMap, map: &CachedMeshMap) -> Option<Vec<f32>> {
-    let texels = (map.width as usize).saturating_mul(map.height as usize);
-    let src = map.channels as usize;
-    if src == 0 || map.pixels_f32.len() < texels.saturating_mul(src) {
-        return None;
-    }
-    let comps = kind.components();
-    let mut out = Vec::with_capacity(texels.saturating_mul(comps));
-    for i in 0..texels {
-        let base = i * src;
-        if comps == 1 {
-            out.push(map.pixels_f32[base]);
-        } else if src >= 3 {
-            out.extend_from_slice(&map.pixels_f32[base..base + 3]);
-        } else {
-            out.extend(std::iter::repeat_n(map.pixels_f32[base], 3));
-        }
-    }
-    Some(out)
-}
-
-fn import_texture_cache(s: &mut Session, caches: &[CachedMaterialChannels]) -> Result<usize> {
-    let mut applied = 0usize;
-    for cache in caches {
-        let Some(ts) = s.doc.project.texture_sets.iter().position(|set| set.name.eq_ignore_ascii_case(&cache.material_name)) else { continue };
-        let channels = s.doc.project.texture_set(ts)?.channel_list();
-        let mut fill = Fill::default();
-        let mut enabled = BTreeSet::new();
-        let stem = cache.material_name.replace(['\\', '/', ':'], "_");
-        if let Some(rgba) = &cache.base_color_rgba8 {
-            let name = format!("{stem}_BaseColor.png");
-            let png = texturecraft_projectfiles::pixels::png_rgba8(cache.width, cache.height, rgba).map_err(EngineError::Other)?;
-            let name = s.store_resource_bytes(&name, png)?;
-            fill.sources.insert(Channel::BaseColor, Source::image(name));
-            enabled.insert(Channel::BaseColor);
-        }
-        if let Some(ga) = &cache.roughness_ga8 {
-            let values = ga.chunks(2).map(|c| c[0] as f32 / 255.0).collect::<Vec<_>>();
-            add_gray(s, &mut fill, &mut enabled, Channel::Roughness, &format!("{stem}_Roughness.exr"), (cache.width, cache.height), &values)?;
-        }
-        if let Some(ga) = &cache.metallic_ga8 {
-            let values = ga.chunks(2).map(|c| c[0] as f32 / 255.0).collect::<Vec<_>>();
-            add_gray(s, &mut fill, &mut enabled, Channel::Metallic, &format!("{stem}_Metallic.exr"), (cache.width, cache.height), &values)?;
-        }
-        if let Some(height) = &cache.height_f32 {
-            // The cache stores signed height (0 is flat). A signed channel reads an image as value * 2 - 1.
-            let encoded: Vec<f32> = height.iter().map(|v| (if v.is_finite() { *v } else { 0.0 }) * 0.5 + 0.5).collect();
-            add_gray(s, &mut fill, &mut enabled, Channel::Height, &format!("{stem}_Height.exr"), (cache.width, cache.height), &encoded)?;
-        }
-        if let Some(normal) = &cache.normal_rgb_f32 {
-            let name = format!("{stem}_Normal.exr");
-            let exr = texturecraft_projectfiles::pixels::exr_rgb(cache.width, cache.height, normal).map_err(EngineError::Other)?;
-            let name = s.store_resource_bytes(&name, exr)?;
-            fill.sources.insert(Channel::Normal, Source::image(name));
-            enabled.insert(Channel::Normal);
-        }
-        enabled.retain(|c| channels.contains(c));
-        fill.sources.retain(|c, _| enabled.contains(c));
-        if enabled.is_empty() {
-            continue;
-        }
-        let id = s.doc.project.alloc_id();
-        let mut layer = Layer::new(id, "Texture cache", LayerKind::Fill(fill), &channels);
-        layer.channels.retain(|c, _| enabled.contains(c));
-        s.doc.project.insert_layer(ts, layer, None, false)?;
-        s.selected.insert(ts, id);
-        applied += 1;
-    }
-    Ok(applied)
-}
-
-fn add_gray(s: &mut Session, fill: &mut Fill, enabled: &mut BTreeSet<Channel>, channel: Channel, name: &str, size: (u32, u32), values: &[f32]) -> Result<()> {
-    let exr = texturecraft_projectfiles::pixels::exr_gray(size.0, size.1, values).map_err(EngineError::Other)?;
-    let name = s.store_resource_bytes(name, exr)?;
-    fill.sources.insert(channel, Source::image(name));
-    enabled.insert(channel);
-    Ok(())
 }
 
 fn stack_resolution(stack: &SppStackFile) -> u32 {

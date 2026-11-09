@@ -35,7 +35,3 @@ pub(crate) fn le_i64(bytes: &[u8], off: usize) -> Option<i64> {
 pub(crate) fn le_f32(bytes: &[u8], off: usize) -> Option<f32> {
     le_bytes(bytes, off).map(f32::from_le_bytes)
 }
-
-pub(crate) fn be_u32(bytes: &[u8], off: usize) -> Option<u32> {
-    le_bytes(bytes, off).map(u32::from_be_bytes)
-}

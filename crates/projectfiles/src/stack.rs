@@ -1,4 +1,4 @@
-//! Layer stack exported from the reference format `document.bin`.
+//! Layer stack read from a project's `document.bin`.
 #![allow(dead_code)]
 
 use std::path::Path;
