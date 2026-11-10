@@ -136,7 +136,7 @@ fn visible_surface(session: &Session, screen: Vec2, viewport: Vec2) -> Option<(V
         sets.iter().find(|set| set.material == material).is_none_or(|set| set.visible)
     };
 
-    let hit = session.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, &visible)?;
+    let hit = session.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, visible)?;
     let surface = surface_at(&session.mesh, hit.tri, hit.u, hit.v)?;
     Some((surface.uv, session.mesh.material_of(hit.tri as usize).unwrap_or(0)))
 }

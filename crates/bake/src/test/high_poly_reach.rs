@@ -83,7 +83,7 @@ fn a_vertex_is_missed_exactly_when_the_bake_ray_misses_it() {
                 let surface = surface_at(&low, nearest.tri, nearest.u, nearest.v).unwrap();
                 let (ray, _) = context.transfer_ray(&surface, [nearest.u, nearest.v]);
                 let hit = high_bvh
-                    .closest_filtered(ray.origin, ray.direction, ray.max_distance, &|triangle| !(ignore_backface && back_facing(triangle, ray.direction)));
+                    .closest_filtered(ray.origin, ray.direction, ray.max_distance, |triangle| !(ignore_backface && back_facing(triangle, ray.direction)));
                 let reaches_the_vertex = hit.is_some_and(|hit| (ray.origin + ray.direction * hit.t - vertex_reach.high_position).length() < HIT_TOLERANCE);
                 assert_eq!(
                     missed, !reaches_the_vertex,
@@ -186,7 +186,7 @@ fn matching_by_mesh_name_misses_the_parts_with_another_name() {
         let surface = surface_at(&low, nearest.tri, nearest.u, nearest.v).unwrap();
         let (ray, _) = context.transfer_ray(&surface, [nearest.u, nearest.v]);
         let same_name = |triangle: u32| ray.key == ANY || high_keys.get(triangle as usize) == Some(&ray.key);
-        let hit = high_bvh.closest_filtered(ray.origin, ray.direction, ray.max_distance, &same_name);
+        let hit = high_bvh.closest_filtered(ray.origin, ray.direction, ray.max_distance, same_name);
         let reaches_the_vertex = hit.is_some_and(|hit| (ray.origin + ray.direction * hit.t - vertex_reach.high_position).length() < HIT_TOLERANCE);
         assert_eq!(missed, !reaches_the_vertex, "vertex {vertex} at {}", vertex_reach.high_position);
         assert_eq!(

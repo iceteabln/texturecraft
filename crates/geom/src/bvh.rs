@@ -675,7 +675,7 @@ mod tests {
         assert!(!bvh.occluded(origin, Vec3::NEG_Z, 5.0));
 
         // Median partitions preserve original triangle IDs
-        let hit = bvh.closest_filtered(Vec3::new(0.0, 0.0, 10.0), Vec3::NEG_Z, 100.0, &|t| t == 500).unwrap();
+        let hit = bvh.closest_filtered(Vec3::new(0.0, 0.0, 10.0), Vec3::NEG_Z, 100.0, |t| t == 500).unwrap();
         assert_eq!(hit.tri, 500);
         assert_eq!(hit.t, 10.0);
     }

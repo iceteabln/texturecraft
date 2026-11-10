@@ -62,7 +62,7 @@ impl Hemisphere {
             let hit = if any_hit && !filtered {
                 mesh.bvh.occluded(ray_origin, direction, ray_length).then_some(texturecraft_geom::Hit { t: 0.0, tri: 0, u: 0.0, v: 0.0 })
             } else if filtered {
-                mesh.bvh.closest_filtered(ray_origin, direction, ray_length, &|triangle| {
+                mesh.bvh.closest_filtered(ray_origin, direction, ray_length, |triangle| {
                     let ignore_backface = match self.ignore_backface {
                         BackfaceMode::Never => false,
                         BackfaceMode::Always => true,

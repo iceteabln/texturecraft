@@ -20,7 +20,7 @@ impl RayScene for CpuScene<'_> {
                 if ray.key == ANY && !ignore_backface {
                     trace_mesh.bvh.closest(ray.origin, ray.direction, ray.max_distance)
                 } else {
-                    trace_mesh.bvh.closest_filtered(ray.origin, ray.direction, ray.max_distance, &|triangle| {
+                    trace_mesh.bvh.closest_filtered(ray.origin, ray.direction, ray.max_distance, |triangle| {
                         trace_mesh.key_matches(triangle, ray.key) && !(ignore_backface && trace_mesh.back_facing(triangle, ray.direction))
                     })
                 }
